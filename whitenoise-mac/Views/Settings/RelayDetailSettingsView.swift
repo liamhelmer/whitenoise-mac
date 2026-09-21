@@ -24,7 +24,7 @@
 import SwiftUI
 
 struct RelayDetailSettingsView: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: RelaySettingsViewModel
     let relay: RelayEndpointItem
     let onBack: () -> Void
 
@@ -32,7 +32,7 @@ struct RelayDetailSettingsView: View {
 
     /// The roles that have no other relay, which is what disables both the toggle and Remove.
     private var lockedRoles: [RelayRole] {
-        workspace.relaySettings.rolesDependingOnly(on: relay.url)
+        model.settings.rolesDependingOnly(on: relay.url)
     }
 
     var body: some View {
@@ -67,6 +67,7 @@ struct RelayDetailSettingsView: View {
             // (see `SettingsGroupedForm`). The section titled `Use for` is the first of them.
             ForEach(Array(RelayRole.allCases.enumerated()), id: \.element) { index, role in
                 RelayRoleToggleSection(
+                    model: model,
                     relay: relay,
                     role: role,
                     title: index == 0 ? L10n.string("Use for") : nil,
@@ -80,7 +81,7 @@ struct RelayDetailSettingsView: View {
                 } label: {
                     Text(L10n.string("Remove relay"))
                 }
-                .disabled(!lockedRoles.isEmpty || workspace.isSavingRelays)
+                .disabled(!lockedRoles.isEmpty || model.isSaving)
             }
         }
         .confirmationDialog(
@@ -95,7 +96,7 @@ struct RelayDetailSettingsView: View {
                 // being deleted — the prototype's "confirmation first dismisses the alert and
                 // returns to Relays, then removes the endpoint".
                 onBack()
-                Task { await workspace.removeRelay(relay.url) }
+                Task { await model.removeRelay(relay.url) }
             }
             Button(L10n.string("Cancel"), role: .cancel) {}
         } message: {
@@ -118,7 +119,7 @@ struct RelayDetailSettingsView: View {
 
 /// One role's toggle, with the role's own explanation under it.
 struct RelayRoleToggleSection: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: RelaySettingsViewModel
     let relay: RelayEndpointItem
     let role: RelayRole
     var title: String?
@@ -135,7 +136,7 @@ struct RelayRoleToggleSection: View {
                     get: { relay.roles.contains(role) },
                     set: { isEnabled in
                         Task {
-                            await workspace.setRelayRole(role, isEnabled: isEnabled, forRelay: relay.url)
+                            await model.setRole(role, isEnabled: isEnabled, forRelay: relay.url)
                         }
                     }
                 )
@@ -147,7 +148,7 @@ struct RelayRoleToggleSection: View {
     /// A locked toggle is only disabled while it is *on*: the state it cannot leave. Assigning
     /// the role stays available, which is what makes a second relay for it reachable at all.
     private var isDisabled: Bool {
-        workspace.isSavingRelays || (isLocked && relay.roles.contains(role))
+        model.isSaving || (isLocked && relay.roles.contains(role))
     }
 
     private var footer: String {

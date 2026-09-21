@@ -91,6 +91,49 @@ struct AccountTests: WorkspaceTestSupport {
         #expect(runtime.startCallCount == 1)
     }
 
+    @MainActor
+    @Test func loginPersistsCheckpointAndStaysInOnboardingUntilDurablyReady() async throws {
+        let loggedIn = AccountSummaryFfi(
+            label: "Pending Account",
+            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            localSigning: true,
+            externalSigning: false,
+            signedOut: false,
+            running: false
+        )
+        let runtime = FakeMarmotRuntime(accounts: [], createdAccount: loggedIn)
+        runtime.onboardingState = OnboardingSnapshotFfi(
+            accountIdHex: loggedIn.accountIdHex,
+            recoveryEpoch: nil,
+            revision: 4,
+            ready: false,
+            steps: [
+                OnboardingStepStateFfi(
+                    step: .profile,
+                    status: .pending,
+                    findings: [],
+                    actions: [],
+                    checkedAt: nil
+                )
+            ],
+            proposal: nil,
+            singleDeviceNotice: nil,
+            cancellationPending: false
+        )
+        let state = WorkspaceState(clientFactory: { runtime })
+
+        await state.bootstrap()
+        state.showLogin()
+        state.loginIdentity = "nsec1checkpoint"
+        await state.login()
+
+        #expect(runtime.begunOnboardingIdentities == ["nsec1checkpoint"])
+        #expect(state.loginIdentity.isEmpty)
+        #expect(state.phase == .onboarding)
+        #expect(state.activeAccountId == loggedIn.label)
+        #expect(runtime.didStart)
+    }
+
     /// The way back into a deactivated identity, now that no surface offers to reactivate one
     /// with a click while nothing is signed in.
     ///
@@ -498,17 +541,11 @@ struct AccountTests: WorkspaceTestSupport {
         #expect(runtime.syncCallThreadRecord("telemetryInstallId").allSatisfy { !$0 })
         #expect(runtime.syncCallThreadRecord("setAuditLogTrackerConfig").contains(false))
         #expect(runtime.syncCallThreadRecord("setAuditLogTrackerConfig").allSatisfy { !$0 })
-        #expect(runtime.syncCallThreadRecord("relayTelemetrySettings").contains(false))
-        #expect(runtime.syncCallThreadRecord("relayTelemetrySettings").allSatisfy { !$0 })
-        #expect(runtime.syncCallThreadRecord("auditLogSettings").contains(false))
-        #expect(runtime.syncCallThreadRecord("auditLogSettings").allSatisfy { !$0 })
-        #expect(runtime.syncCallThreadRecord("auditLogFiles").contains(false))
-        #expect(runtime.syncCallThreadRecord("auditLogFiles").allSatisfy { !$0 })
     }
 
     @MainActor
     @Test func loadSettingsDataRunsSynchronousRuntimeReadsOffMainThread() async throws {
-        // The Settings screen pulls profile, relay, notification, telemetry, and audit
+        // The legacy aggregate pulls profile, relay, and notification
         // snapshots. Those are synchronous FFI reads and must not block the run loop.
         let account = AccountSummaryFfi(
             label: "Desktop Account",
@@ -531,54 +568,6 @@ struct AccountTests: WorkspaceTestSupport {
         #expect(runtime.syncCallThreadRecord("accountRelayLists").allSatisfy { !$0 })
         #expect(runtime.syncCallThreadRecord("notificationSettings").contains(false))
         #expect(runtime.syncCallThreadRecord("notificationSettings").allSatisfy { !$0 })
-        #expect(runtime.syncCallThreadRecord("relayTelemetrySettings").contains(false))
-        #expect(runtime.syncCallThreadRecord("relayTelemetrySettings").allSatisfy { !$0 })
-        #expect(runtime.syncCallThreadRecord("auditLogSettings").contains(false))
-        #expect(runtime.syncCallThreadRecord("auditLogSettings").allSatisfy { !$0 })
-        #expect(runtime.syncCallThreadRecord("auditLogFiles").contains(false))
-        #expect(runtime.syncCallThreadRecord("auditLogFiles").allSatisfy { !$0 })
-    }
-
-    @MainActor
-    @Test func overlappingAuditLogFileLoadsCoalesceWhileLoadIsInFlight() async throws {
-        // Regression for #366: loadAuditLogFiles() owns a shared spinner flag. A second
-        // overlapping load must not enqueue a concurrent FFI fetch whose completion can race
-        // the first load's defer, but it should request one fresh pass after the current load
-        // so mutation-triggered refreshes are not dropped.
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        runtime.clearSyncCallThreadRecords()
-        runtime.auditLogFilesGateEnabled = true
-
-        async let firstLoad: Void = state.loadAuditLogFiles()
-        while !(state.isLoadingAuditLogFiles && runtime.didReachAuditLogFilesGate) {
-            await Task.yield()
-        }
-
-        async let secondLoad: Void = state.loadAuditLogFiles()
-        for _ in 0..<20 {
-            await Task.yield()
-        }
-
-        #expect(state.isLoadingAuditLogFiles)
-        #expect(runtime.syncCallThreadRecord("auditLogFiles").count == 1)
-
-        runtime.releaseAuditLogFilesGate()
-        await firstLoad
-        await secondLoad
-
-        #expect(runtime.syncCallThreadRecord("auditLogFiles").count == 2)
-        #expect(state.isLoadingAuditLogFiles == false)
     }
 
     @MainActor
@@ -1900,17 +1889,6 @@ struct AccountTests: WorkspaceTestSupport {
 
         await state.bootstrap()
         state.showSettings(.privacySecurity)
-        state.auditLogFiles = [
-            AuditLogFileFfi(
-                accountRef: primary.label,
-                path: "/tmp/audit-1.jsonl",
-                fileName: "audit-1.jsonl",
-                sizeBytes: 128,
-                modifiedAtMs: 1_700_000_000_000
-            )
-        ]
-        state.auditLogUploadStatus = "Uploaded 1 audit log file."
-
         await state.deleteAllData()
 
         #expect(runtime.didDeleteAllLocalData)
@@ -1920,8 +1898,6 @@ struct AccountTests: WorkspaceTestSupport {
         #expect(state.accounts.isEmpty)
         #expect(state.activeAccountId == nil)
         #expect(state.selection == nil)
-        #expect(state.auditLogFiles.isEmpty)
-        #expect(state.auditLogUploadStatus == nil)
         #expect(!state.showsMessengerChrome)
         #expect(UserDefaults.standard.string(forKey: "whitenoise.mac.activeAccountId") == nil)
     }
@@ -2021,44 +1997,6 @@ struct AccountTests: WorkspaceTestSupport {
     }
 
     @MainActor
-    @Test func accountSwitchAndNewInstallResetClearDecryptedSharedMediaCache() async throws {
-        let primary = desktopAccount()
-        let secondary = AccountSummaryFfi(
-            label: "Backup Account",
-            accountIdHex: String(repeating: "1", count: 64),
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [primary, secondary])
-        let state = WorkspaceState(clientFactory: { runtime })
-        await state.bootstrap()
-
-        func installDecryptedCacheFixture() {
-            state.sharedMediaGroupId = "private-group"
-            state.sharedMediaThumbnailCache = ["private-image": Data([1, 2, 3])]
-            state.sharedMediaThumbnailCacheOrder = ["private-image"]
-            state.sharedMediaThumbnailCacheBytes = 3
-        }
-
-        installDecryptedCacheFixture()
-        let backup = try #require(state.accounts.first { $0.id == secondary.label })
-        state.prepareForActiveAccountSwitch(to: backup, preservingMessageCacheFor: nil)
-        #expect(state.sharedMediaGroupId == nil)
-        #expect(state.sharedMediaThumbnailCache.isEmpty)
-        #expect(state.sharedMediaThumbnailCacheOrder.isEmpty)
-        #expect(state.sharedMediaThumbnailCacheBytes == 0)
-
-        installDecryptedCacheFixture()
-        state.resetToNewInstallState(storageRootPath: state.storageRootPath)
-        #expect(state.sharedMediaGroupId == nil)
-        #expect(state.sharedMediaThumbnailCache.isEmpty)
-        #expect(state.sharedMediaThumbnailCacheOrder.isEmpty)
-        #expect(state.sharedMediaThumbnailCacheBytes == 0)
-    }
-
-    @MainActor
     @Test func failedDeleteAllDataRestartsReadySessionListenersAndReloadsSelectedChat() async throws {
         let previousActiveAccount = UserDefaults.standard.object(forKey: "whitenoise.mac.activeAccountId")
         defer { restoreDefault(previousActiveAccount, forKey: "whitenoise.mac.activeAccountId") }
@@ -2135,7 +2073,7 @@ struct AccountTests: WorkspaceTestSupport {
         #expect(state.accounts.isEmpty)
         #expect((state.client as? FakeMarmotRuntime) === freshRuntime)
         #expect(state.notificationTask == nil)
-        #expect(state.chatListTask == nil)
+        #expect(state.reloadChatsTask == nil)
         #expect(state.timelineTask == nil)
         #expect(state.lastError == "Unused fake runtime error.")
     }
@@ -2189,717 +2127,6 @@ struct AccountTests: WorkspaceTestSupport {
         #expect(await waitFor { runtime.chatListSubscriptionCount >= 1 })
         #expect(await waitFor { runtime.notificationSubscriptionCount >= 1 })
         #expect(state.backgroundStatus == "Observability configuration failed.")
-    }
-
-    @MainActor
-    @Test func deleteAllDataClearsAccountUnreadBadges() async throws {
-        let primary = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [primary])
-        runtime.accountUnreadSummaryRows = [
-            AccountUnreadFfi(
-                accountIdHex: primary.accountIdHex,
-                unreadCount: 7,
-                unreadConversations: 1,
-                hasUnread: true
-            )
-        ]
-        UserDefaults.standard.set("Desktop Account", forKey: "whitenoise.mac.activeAccountId")
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: primary.accountIdHex) == 7)
-
-        await state.deleteAllData()
-
-        // The per-account unread cache must not survive a full local-data wipe. See #213.
-        #expect(state.unreadCount(forAccountIdHex: primary.accountIdHex) == 0)
-    }
-
-    @MainActor
-    @Test func resetActiveAccountUIStateClearsAccountUnreadBadges() async throws {
-        let primary = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [primary])
-        runtime.accountUnreadSummaryRows = [
-            AccountUnreadFfi(
-                accountIdHex: primary.accountIdHex,
-                unreadCount: 4,
-                unreadConversations: 1,
-                hasUnread: true
-            )
-        ]
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: primary.accountIdHex) == 4)
-
-        state.resetActiveAccountUIState()
-
-        // Sign-out and active-account removal share this reset path. See #213.
-        #expect(state.unreadCount(forAccountIdHex: primary.accountIdHex) == 0)
-    }
-
-    @MainActor
-    @Test func accountUnreadSummaryClampsOversizedUnreadCount() async throws {
-        let primary = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [primary])
-        runtime.accountUnreadSummaryRows = [
-            AccountUnreadFfi(
-                accountIdHex: primary.accountIdHex,
-                unreadCount: UInt64(Int.max) + 1,
-                unreadConversations: 1,
-                hasUnread: true
-            )
-        ]
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.refreshAccountUnreadSummary()
-
-        #expect(state.unreadCount(forAccountIdHex: primary.accountIdHex) == Int.max)
-    }
-
-    @MainActor
-    @Test func readingTheActiveAccountsChatsClearsItsAvatarUnreadBadge() async throws {
-        // The rail avatar badge reads the per-account summary, which used to be re-queried only on
-        // sign-in/out and full chat-list reloads. Reading a chat reaches the app as a live row
-        // delta, so the active account's avatar kept a badge for messages it had already read
-        // until the next account switch.
-        let account = desktopAccount()
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.installGroup(messageGroup())
-        runtime.accountUnreadSummaryRows = [
-            AccountUnreadFfi(
-                accountIdHex: account.accountIdHex,
-                unreadCount: 5,
-                unreadConversations: 1,
-                hasUnread: true
-            )
-        ]
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.chatListEnrichmentTask?.value
-        let activeAccount = try #require(state.activeAccount)
-        let chat = try #require(state.activeChats.first)
-
-        await state.applyChatListSubscriptionUpdate(
-            .row(
-                trigger: .unreadChanged,
-                row: chatListRow(
-                    groupIdHex: chat.id,
-                    title: "Test Group",
-                    preview: "Unread message",
-                    sender: account.accountIdHex,
-                    timelineAt: 1_700_000_100,
-                    unreadCount: 5,
-                    hasUnread: true
-                )
-            ),
-            account: activeAccount
-        )
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 5)
-
-        // The user opens the chat: the read marker commits and the backend stops reporting unread.
-        runtime.accountUnreadSummaryRows = [
-            AccountUnreadFfi(
-                accountIdHex: account.accountIdHex,
-                unreadCount: 0,
-                unreadConversations: 0,
-                hasUnread: false
-            )
-        ]
-        await state.applyChatListSubscriptionUpdate(
-            .row(
-                trigger: .unreadChanged,
-                row: chatListRow(
-                    groupIdHex: chat.id,
-                    title: "Test Group",
-                    preview: "Unread message",
-                    sender: account.accountIdHex,
-                    timelineAt: 1_700_000_100
-                )
-            ),
-            account: activeAccount
-        )
-
-        #expect(state.activeChats.first?.unreadCount == 0)
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-    }
-
-    @MainActor
-    @Test func aBackgroundAccountsIncomingMessageMovesItsAvatarBadge() async throws {
-        // Chat-list subscriptions run for the active account only, so nothing told the app that a
-        // background account had new messages: its rail badge sat on whatever the last account
-        // switch or full reload recorded until the user switched to it. The client-wide
-        // notification stream is the live signal that it moved.
-        let backup = backupAccountSummary()
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.installNotificationSettings(
-            accountRef: backup.label,
-            settings: notificationSettings(for: backup, localEnabled: true)
-        )
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0),
-            unreadSummaryRow(accountIdHex: backup.accountIdHex, unreadCount: 0),
-        ]
-        let notificationCenter = FakeLocalNotificationCenter(status: .authorized)
-        let (state, active) = unreadBadgeFixture(
-            runtime: runtime,
-            seededUnreadCount: 0,
-            localNotificationCenter: notificationCenter
-        )
-        state.accounts.append(AccountItem(summary: backup))
-
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: backup.accountIdHex) == 0)
-
-        // A message lands on the backup account while the user stays on the active one.
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0),
-            unreadSummaryRow(accountIdHex: backup.accountIdHex, unreadCount: 4),
-        ]
-        await state.handleNotificationUpdate(
-            notificationUpdate(
-                account: backup,
-                notificationKey: "notice-for-backup",
-                senderName: "Alice",
-                previewText: "Hi there."
-            ))
-
-        #expect(state.activeAccountId == active.id)
-        #expect(state.unreadCount(forAccountIdHex: backup.accountIdHex) == 4)
-        #expect(notificationCenter.postedRequests.map(\.identifier) == ["notice-for-backup"])
-    }
-
-    @MainActor
-    @Test func aBackgroundAccountWithNotificationsOffStillMovesItsAvatarBadge() async throws {
-        // The badge counts unread messages, not banners the user agreed to see, so the refresh sits
-        // above every delivery gate: turning local notifications off for an account must not freeze
-        // its rail badge at the last switch's total.
-        let backup = backupAccountSummary()
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.installNotificationSettings(
-            accountRef: backup.label,
-            settings: notificationSettings(for: backup, localEnabled: false)
-        )
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0),
-            unreadSummaryRow(accountIdHex: backup.accountIdHex, unreadCount: 6),
-        ]
-        let notificationCenter = FakeLocalNotificationCenter(status: .authorized)
-        let (state, _) = unreadBadgeFixture(
-            runtime: runtime,
-            seededUnreadCount: 0,
-            localNotificationCenter: notificationCenter
-        )
-        state.accounts.append(AccountItem(summary: backup))
-
-        await state.handleNotificationUpdate(
-            notificationUpdate(
-                account: backup,
-                notificationKey: "silent-notice",
-                senderName: "Alice",
-                previewText: "Hi there."
-            ))
-
-        #expect(state.unreadCount(forAccountIdHex: backup.accountIdHex) == 6)
-        #expect(notificationCenter.postedRequests.isEmpty)
-    }
-
-    @MainActor
-    @Test func anActiveAccountNotificationLeavesTheUnreadSummaryToTheChatRowPath() async throws {
-        // The active account's chat-list subscription delivers the same message as a row delta,
-        // which already refreshes the summary. Querying from the notification too would put a
-        // second summary read on every message the account in front of the user receives.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 2)
-        ]
-        let notificationCenter = FakeLocalNotificationCenter(status: .authorized)
-        let (state, account) = unreadBadgeFixture(
-            runtime: runtime,
-            seededUnreadCount: 2,
-            localNotificationCenter: notificationCenter
-        )
-        let activeSummary = AccountSummaryFfi(
-            label: account.accountRef,
-            accountIdHex: account.accountIdHex,
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        runtime.installNotificationSettings(
-            accountRef: activeSummary.label,
-            settings: notificationSettings(for: activeSummary, localEnabled: true)
-        )
-
-        await state.refreshAccountUnreadSummary()
-        let queriesSoFar = runtime.accountUnreadSummaryCallCount
-
-        await state.handleNotificationUpdate(
-            notificationUpdate(
-                account: activeSummary,
-                notificationKey: "notice-for-active",
-                senderName: "Alice",
-                previewText: "Hi there."
-            ))
-
-        #expect(runtime.accountUnreadSummaryCallCount == queriesSoFar)
-        #expect(notificationCenter.postedRequests.map(\.identifier) == ["notice-for-active"])
-    }
-
-    @MainActor
-    @Test func chatRowDeltasThatLeaveUnreadAloneDoNotRequeryTheAccountUnreadSummary() async throws {
-        // The badge follows the rows, but a summary query per row delta would put an FFI call on
-        // every read-marker advance and every incoming preview. Only a moved unread total re-queries.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 3)
-        ]
-        let (state, account) = unreadBadgeFixture(runtime: runtime, seededUnreadCount: 3)
-
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 3)
-        let queriesSoFar = runtime.accountUnreadSummaryCallCount
-
-        // A newer message on a row that stays just as unread.
-        await state.applyChatRow(
-            unreadBadgeFixtureRow(timelineAt: 1_700_000_100, unreadCount: 3),
-            account: account,
-            shouldEnrich: false
-        )
-        #expect(state.activeChats.first?.updatedAt == Date(timeIntervalSince1970: 1_700_000_100))
-        #expect(runtime.accountUnreadSummaryCallCount == queriesSoFar)
-
-        // The same row, now read: the badge has to follow it down, so this one does query.
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0)
-        ]
-        await state.applyChatRow(
-            unreadBadgeFixtureRow(timelineAt: 1_700_000_200, unreadCount: 0),
-            account: account,
-            shouldEnrich: false
-        )
-        #expect(runtime.accountUnreadSummaryCallCount == queriesSoFar + 1)
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-    }
-
-    @MainActor
-    @Test func archivingAnUnreadChatDropsItFromTheAvatarBadge() async throws {
-        // The summary counts unarchived conversations alone, so archiving an unread chat has to
-        // take its messages off the rail badge. It did not: the row gate compared totals that
-        // counted the archived list too, so the move left the signal untouched — the chat's unread
-        // was still in it, just under a different key — and the badge kept counting a chat the user
-        // had put away until the next full reload or account switch.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 3)
-        ]
-        let (state, account) = unreadBadgeFixture(runtime: runtime, seededUnreadCount: 3)
-
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 3)
-        let queriesSoFar = runtime.accountUnreadSummaryCallCount
-
-        // The archived row keeps its unread count — the core does not clear it, it stops counting
-        // it — which is exactly what made this move invisible to a signal spanning both lists.
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0)
-        ]
-        await state.applyChatRow(
-            unreadBadgeFixtureRow(timelineAt: 1_700_000_100, unreadCount: 3, archived: true),
-            account: account,
-            shouldEnrich: false
-        )
-
-        #expect(state.activeChats.isEmpty)
-        #expect(state.archivedChats.map(\.unreadCount) == [3])
-        #expect(runtime.accountUnreadSummaryCallCount == queriesSoFar + 1)
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-    }
-
-    @MainActor
-    @Test func unarchivingAnUnreadChatPutsItBackOnTheAvatarBadge() async throws {
-        // The other direction of the same move: restoring a chat that was archived unread returns
-        // its messages to the total the badge shows, and the gate has to notice that too.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0)
-        ]
-        let (state, account) = unreadBadgeFixture(
-            runtime: runtime,
-            seededUnreadCount: 0,
-            archivedChats: [
-                chatListOrderingTestItem(
-                    id: "archived-group",
-                    title: "Archived Group",
-                    updatedAt: 1_700_000_000,
-                    unreadCount: 4
-                )
-            ]
-        )
-
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-        let queriesSoFar = runtime.accountUnreadSummaryCallCount
-
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 4)
-        ]
-        await state.applyChatRow(
-            chatListRow(
-                groupIdHex: "archived-group",
-                title: "Archived Group",
-                preview: "A message from before it was archived",
-                sender: unreadBadgeFixtureAccountIdHex,
-                timelineAt: 1_700_000_100,
-                unreadCount: 4,
-                hasUnread: true
-            ),
-            account: account,
-            shouldEnrich: false
-        )
-
-        #expect(state.archivedChats.isEmpty)
-        #expect(runtime.accountUnreadSummaryCallCount == queriesSoFar + 1)
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 4)
-    }
-
-    @MainActor
-    @Test func readingAnArchivedChatDoesNotRequeryTheAccountUnreadSummary() async throws {
-        // The flip side of scoping the gate to unarchived rows: nothing an archived chat's unread
-        // does can move a total that excludes it, so scrolling through one must not put a summary
-        // query on every read-marker advance it produces.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0)
-        ]
-        let (state, account) = unreadBadgeFixture(
-            runtime: runtime,
-            seededUnreadCount: 0,
-            archivedChats: [
-                chatListOrderingTestItem(
-                    id: "archived-group",
-                    title: "Archived Group",
-                    updatedAt: 1_700_000_000,
-                    unreadCount: 6
-                )
-            ]
-        )
-
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-        let queriesSoFar = runtime.accountUnreadSummaryCallCount
-
-        // A marker advance inside the archived chat, then a newer message arriving in it.
-        await state.applyChatRow(
-            chatListRow(
-                groupIdHex: "archived-group",
-                title: "Archived Group",
-                preview: "Read now",
-                sender: unreadBadgeFixtureAccountIdHex,
-                timelineAt: 1_700_000_100,
-                unreadCount: 0,
-                archived: true
-            ),
-            account: account,
-            shouldEnrich: false
-        )
-        await state.applyChatRow(
-            chatListRow(
-                groupIdHex: "archived-group",
-                title: "Archived Group",
-                preview: "And a new one",
-                sender: unreadBadgeFixtureAccountIdHex,
-                timelineAt: 1_700_000_200,
-                unreadCount: 1,
-                hasUnread: true,
-                archived: true
-            ),
-            account: account,
-            shouldEnrich: false
-        )
-
-        #expect(state.archivedChats.map(\.unreadCount) == [1])
-        #expect(runtime.accountUnreadSummaryCallCount == queriesSoFar)
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-    }
-
-    @MainActor
-    @Test func aLateAccountUnreadSummaryAnswerDoesNotRestoreTheClearedBadge() async throws {
-        // A read-marker advance and a chat-list reload race routinely, so two summary queries can
-        // be in flight and answer out of order. A late pre-read answer landing last must not put
-        // the badge back — nor record its signal, which would leave the row gate suppressing the
-        // refresh that would correct it.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 5)
-        ]
-        let (state, account) = unreadBadgeFixture(runtime: runtime, seededUnreadCount: 5)
-
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 5)
-
-        // Park the older query inside the FFI, still holding the pre-read total of 5.
-        runtime.accountUnreadSummaryGateEnabled = true
-        let staleRefresh = Task { await state.refreshAccountUnreadSummary() }
-        #expect(await waitFor { runtime.didReachAccountUnreadSummaryGate })
-
-        // The chat is read: the row delta gates a newer query, which answers first with nothing
-        // unread while the older one is still parked.
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0)
-        ]
-        await state.applyChatRow(
-            unreadBadgeFixtureRow(timelineAt: 1_700_000_100, unreadCount: 0),
-            account: account,
-            shouldEnrich: false
-        )
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-
-        runtime.releaseAccountUnreadSummaryGate()
-        await staleRefresh.value
-
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-        #expect(state.lastSummarizedAccountUnread?.totalUnreadCount == 0)
-    }
-
-    @MainActor
-    @Test func anAccountUnreadSummaryAnswerForASupersededAccountIsDiscarded() async throws {
-        // The totals are keyed by account, but the recorded signal is not: committing an answer
-        // requested by a since-replaced active account would file its counts under the new
-        // account's signal and suppress that account's next refresh.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 5)
-        ]
-        let (state, account) = unreadBadgeFixture(runtime: runtime, seededUnreadCount: 5)
-
-        runtime.accountUnreadSummaryGateEnabled = true
-        let supersededRefresh = Task { await state.refreshAccountUnreadSummary() }
-        #expect(await waitFor { runtime.didReachAccountUnreadSummaryGate })
-
-        // The user switches accounts while the query is still off-main.
-        state.activeAccountId = "some-other-account"
-        runtime.releaseAccountUnreadSummaryGate()
-        await supersededRefresh.value
-
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-        #expect(state.lastSummarizedAccountUnread == nil)
-    }
-
-    @MainActor
-    @Test func aChatListReloadIssuesASingleAccountUnreadSummaryQuery() async throws {
-        // The reload owns one unconditional refresh — the only pass that also re-reads background
-        // accounts' totals — so the snapshot it applies must not gate a second query of its own.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.installGroup(messageGroup())
-        // The selected chat's read-state row is the one other caller that would apply a chat row
-        // during the reload, and it answers off-main; withholding it keeps the queries counted here
-        // attributable to the reload alone.
-        runtime.initializeChatReadStateReturnsRow = false
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0)
-        ]
-        // Seeded unread with a recorded signal to match, so the reload's all-read snapshot moves
-        // the signal and would gate a refresh of its own on top of the reload's own query.
-        let (state, account) = unreadBadgeFixture(runtime: runtime, seededUnreadCount: 5)
-        state.lastSummarizedAccountUnread = state.currentAccountUnreadSignal()
-        state.reloadChatsGeneration = 41
-        let queriesSoFar = runtime.accountUnreadSummaryCallCount
-
-        await state.performChatListReload(accountId: account.id, generation: 41)
-
-        #expect(state.activeChats.first?.unreadCount == 0)
-        #expect(runtime.accountUnreadSummaryCallCount == queriesSoFar + 1)
-    }
-
-    @MainActor
-    @Test func theAvatarBadgeCountsAnUnansweredInviteAsOne() async throws {
-        // An unaccepted invite has no timeline, so it moves no unread total however long it sits in
-        // the chat list: the rail badge read "nothing to see" while rows were asking to be answered.
-        // Each one is worth +1, matching the core's own badge aggregate and the `+` the row draws.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 2)
-        ]
-        let (state, account) = unreadBadgeFixture(
-            runtime: runtime,
-            seededUnreadCount: 2,
-            additionalChats: [
-                pendingInviteChatItem(id: "invite-one"),
-                pendingInviteChatItem(id: "invite-two"),
-            ]
-        )
-
-        await state.refreshAccountUnreadSummary()
-
-        #expect(state.pendingInviteCount(forAccountIdHex: account.accountIdHex) == 2)
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 4)
-    }
-
-    @MainActor
-    @Test func theAvatarBadgeSkipsArchivedAndEndedInvites() async throws {
-        // Parity with the core's `attention_only_conversations`, which counts a pending row only
-        // while it is unarchived and the local membership has not ended. Both exclusions matter to
-        // the badge too: an archived invite was put away deliberately, and an ended membership
-        // supersedes a pending invite outright — the sidebar row draws "Removed" in its place, so a
-        // badge counting it would point at a row that never mentions an invite.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0)
-        ]
-        let (state, account) = unreadBadgeFixture(
-            runtime: runtime,
-            seededUnreadCount: 0,
-            additionalChats: [pendingInviteChatItem(id: "invite-removed", selfMembership: .removed)],
-            archivedChats: [pendingInviteChatItem(id: "invite-archived")]
-        )
-
-        await state.refreshAccountUnreadSummary()
-
-        #expect(state.archivedChats.count == 1)
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-    }
-
-    @MainActor
-    @Test func answeringAnInviteMovesTheBadgeOnTheRowAlone() async throws {
-        // The active account's invites are counted off its live rows rather than off the summary,
-        // so accepting one moves the badge on the chat-row update itself — no FFI round trip to
-        // wait through, and no window where the badge and the list disagree.
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0)
-        ]
-        let (state, account) = unreadBadgeFixture(
-            runtime: runtime,
-            seededUnreadCount: 0,
-            additionalChats: [pendingInviteChatItem(id: "invite")]
-        )
-
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 1)
-        let queriesSoFar = runtime.accountUnreadSummaryCallCount
-
-        // The answered invite comes back as an ordinary row.
-        await state.applyChatRow(
-            pendingInviteRow(groupIdHex: "invite", pendingConfirmation: false),
-            account: account,
-            shouldEnrich: false
-        )
-
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-        #expect(runtime.accountUnreadSummaryCallCount == queriesSoFar)
-    }
-
-    @MainActor
-    @Test func aBackgroundAccountsUnansweredInviteMovesItsAvatarBadge() async throws {
-        // Only the active account runs a chat-list subscription, so a background account's invites
-        // can never arrive as row deltas — its badge would have kept counting messages alone. The
-        // full summary pass reads them off that account's projection, which needs no session load.
-        let backup = backupAccountSummary()
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0),
-            unreadSummaryRow(accountIdHex: backup.accountIdHex, unreadCount: 3),
-        ]
-        runtime.chatListRowsByAccountRef = [
-            backup.label: [
-                pendingInviteRow(groupIdHex: "invite-for-backup"),
-                // The exclusions have to hold on this path too, where the rows arrive unmapped.
-                pendingInviteRow(groupIdHex: "invite-archived", archived: true),
-                pendingInviteRow(groupIdHex: "invite-left", selfMembership: .left),
-                unreadBadgeFixtureRow(timelineAt: 1_700_000_000, unreadCount: 3),
-            ]
-        ]
-        let (state, active) = unreadBadgeFixture(runtime: runtime, seededUnreadCount: 0)
-        state.accounts.append(AccountItem(summary: backup))
-
-        await state.refreshAccountUnreadSummary()
-
-        #expect(state.unreadCount(forAccountIdHex: backup.accountIdHex) == 4)
-        #expect(state.unreadCount(forAccountIdHex: active.accountIdHex) == 0)
-        // The active account is answered from its live rows, so it is never read one-shot here.
-        #expect(runtime.chatListAccountRefs == [backup.label])
-    }
-
-    @MainActor
-    @Test func aFailedInviteReadKeepsTheBadgeItLastRecorded() async throws {
-        // Badges are best-effort. One projection read failing must not drop an invitation off the
-        // rail, which would read as the invite having been answered somewhere else.
-        let backup = backupAccountSummary()
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0),
-            unreadSummaryRow(accountIdHex: backup.accountIdHex, unreadCount: 0),
-        ]
-        runtime.chatListRowsByAccountRef = [backup.label: [pendingInviteRow(groupIdHex: "invite-for-backup")]]
-        let (state, _) = unreadBadgeFixture(runtime: runtime, seededUnreadCount: 0)
-        state.accounts.append(AccountItem(summary: backup))
-
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: backup.accountIdHex) == 1)
-
-        runtime.chatListError = FakeMarmotRuntimeError.unused
-        await state.refreshAccountUnreadSummary()
-
-        #expect(state.unreadCount(forAccountIdHex: backup.accountIdHex) == 1)
-    }
-
-    @MainActor
-    @Test func chatRowDeltasDoNotRereadTheOtherAccountsInviteCounts() async throws {
-        // The row-gated refresh exists so the badge does not put an FFI call on every read-marker
-        // advance. Invitations must not reintroduce one: no delta of the active account's rows can
-        // move another account's invites, and its own are counted off those very rows.
-        let backup = backupAccountSummary()
-        let runtime = FakeMarmotRuntime(accounts: [])
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 3),
-            unreadSummaryRow(accountIdHex: backup.accountIdHex, unreadCount: 0),
-        ]
-        let (state, account) = unreadBadgeFixture(runtime: runtime, seededUnreadCount: 3)
-        state.accounts.append(AccountItem(summary: backup))
-
-        await state.refreshAccountUnreadSummary()
-        let readsSoFar = runtime.chatListCallCount
-
-        // The seeded row, now read: the unread total moved, so the summary itself is re-queried.
-        runtime.accountUnreadSummaryRows = [
-            unreadSummaryRow(accountIdHex: unreadBadgeFixtureAccountIdHex, unreadCount: 0),
-            unreadSummaryRow(accountIdHex: backup.accountIdHex, unreadCount: 0),
-        ]
-        await state.applyChatRow(
-            unreadBadgeFixtureRow(timelineAt: 1_700_000_100, unreadCount: 0),
-            account: account,
-            shouldEnrich: false
-        )
-
-        #expect(state.unreadCount(forAccountIdHex: account.accountIdHex) == 0)
-        #expect(runtime.chatListCallCount == readsSoFar)
     }
 
     @MainActor
@@ -3198,56 +2425,6 @@ struct AccountTests: WorkspaceTestSupport {
         #expect(state.composeContacts.isEmpty)
         #expect(!state.isLoadingComposeContacts)
         #expect(state.composeContactsGeneration == 42)
-    }
-
-    @MainActor
-    @Test func removeNonActiveAccountClearsItsUnreadBadge() async throws {
-        let primary = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let secondary = AccountSummaryFfi(
-            label: "Backup Account",
-            accountIdHex: "1111111111111111111111111111111111111111111111111111111111111111",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [primary, secondary])
-        runtime.accountUnreadSummaryRows = [
-            AccountUnreadFfi(
-                accountIdHex: primary.accountIdHex,
-                unreadCount: 3,
-                unreadConversations: 1,
-                hasUnread: true
-            ),
-            AccountUnreadFfi(
-                accountIdHex: secondary.accountIdHex,
-                unreadCount: 5,
-                unreadConversations: 1,
-                hasUnread: true
-            ),
-        ]
-        UserDefaults.standard.set("Desktop Account", forKey: "whitenoise.mac.activeAccountId")
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.refreshAccountUnreadSummary()
-        #expect(state.unreadCount(forAccountIdHex: secondary.accountIdHex) == 5)
-
-        let backupAccount = try #require(state.accounts.first { $0.id == "Backup Account" })
-        await state.removeAccount(backupAccount)
-
-        // Removing a background identity must drop its unread badge without
-        // disturbing the surviving active account's count. See #213.
-        #expect(state.activeAccountId == "Desktop Account")
-        #expect(state.unreadCount(forAccountIdHex: secondary.accountIdHex) == 0)
-        #expect(state.unreadCount(forAccountIdHex: primary.accountIdHex) == 3)
     }
 
     @Test func deleteAllLocalDataThrowsAndPreservesStorageWhenAccountKeychainPurgeFails() async throws {
@@ -3564,7 +2741,11 @@ struct AccountTests: WorkspaceTestSupport {
             .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
             .joined(separator: "\n")
             .components(separatedBy: .whitespacesAndNewlines).joined()
-        #expect(normalized.contains("ifworkspace.activeAccount==nil{OnboardingView()}else{"))
+        #expect(
+            normalized.contains(
+                "ifworkspace.activeAccount==nil{OnboardingView(model:session.accountScope?.onboarding)}else{"
+            )
+        )
     }
 
     @MainActor
@@ -3649,7 +2830,7 @@ struct AccountTests: WorkspaceTestSupport {
     }
 
     @MainActor
-    @Test func tappingTheActiveAccountAvatarKeepsTheLoadedSessionAndItsListener() async throws {
+    @Test func tappingTheActiveAccountAvatarKeepsTheLoadedSessionAndItsProjection() async throws {
         UserDefaults.standard.set("Desktop Account", forKey: "whitenoise.mac.activeAccountId")
         let runtime = FakeMarmotRuntime(accounts: [desktopAccount()])
         runtime.installGroup(messageGroup())
@@ -3659,17 +2840,16 @@ struct AccountTests: WorkspaceTestSupport {
         let chat = try #require(state.activeChats.first { $0.id == "group" })
         state.selectChat(chat)
         #expect(await waitFor { state.cachedMessageChatIds.contains("group") })
-        #expect(await waitFor { state.chatListTask != nil })
+        let chatListReadsBefore = runtime.chatListSubscriptionCount
 
         let reloadGenerationBefore = state.reloadChatsGeneration
         let active = try #require(state.activeAccount)
 
         state.selectAccount(active)
 
-        // The account-switch teardown stops the chat-list listener and cancels the in-flight
-        // reload (bumping the generation) before re-subscribing both; on a same-account tap the
-        // loaded session has to survive untouched.
-        #expect(state.chatListTask != nil)
+        // A same-account tap must not restart the bounded compatibility read. The app shell's
+        // AccountScope owns the only live prepared-list subscription.
+        #expect(runtime.chatListSubscriptionCount == chatListReadsBefore)
         #expect(state.reloadChatsGeneration == reloadGenerationBefore)
         #expect(state.selection == .chat("group"))
         #expect(state.cachedMessageChatIds.contains("group"))

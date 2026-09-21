@@ -73,6 +73,7 @@ extension EnvironmentValues {
 struct ConversationMessageRow: View {
     @Environment(WorkspaceState.self) private var workspace
     let message: MessageItem
+    let safetyModel: GroupSafetyViewModel
     var showsDebugMetadata = false
     var timestampReferenceDate = Date()
     var timestampLocale = AppLanguage.currentLocale
@@ -119,6 +120,7 @@ struct ConversationMessageRow: View {
         if message.presentation.isChatBubble {
             MessageBubble(
                 message: message,
+                safetyModel: safetyModel,
                 showsDebugMetadata: showsDebugMetadata,
                 timestampReferenceDate: timestampReferenceDate,
                 timestampLocale: timestampLocale,
@@ -201,7 +203,9 @@ struct MessageBubble: View {
     /// unconfirmed long enough to stop reading as "Sending". Separate from the shared
     /// `timestampReferenceDate`, which only moves on calendar-day changes.
     @State private var deliveryClock = Date.now
+    @State private var isReportPresented = false
     let message: MessageItem
+    let safetyModel: GroupSafetyViewModel
     let showsDebugMetadata: Bool
     let timestampReferenceDate: Date
     let timestampLocale: Locale
@@ -311,6 +315,7 @@ struct MessageBubble: View {
                         seed: message.senderAccountIdHex,
                         initials: message.senderName,
                         sanitizedPictureURL: message.senderSanitizedPictureURL,
+                        localImagePayload: message.senderImagePayload,
                         size: 28,
                         isSelected: false
                     )
@@ -326,8 +331,18 @@ struct MessageBubble: View {
         .contentShape(Rectangle())
         .contextMenu {
             if !workspace.isTimelineSelectionMode {
-                MessageContextMenuItems(message: message)
+                MessageContextMenuItems(
+                    message: message,
+                    onReport: { isReportPresented = true }
+                )
             }
+        }
+        .sheet(isPresented: $isReportPresented) {
+            ReportMessageSheet(
+                message: message,
+                model: safetyModel,
+                dismiss: { isReportPresented = false }
+            )
         }
         .onAppear {
             hoverSelectionCoordinator.register(messageID: message.id, isSelectable: $isSelectable)
@@ -402,7 +417,8 @@ struct MessageBubble: View {
         if showsInlineActions {
             MessageInlineActions(
                 isPresentationActive: $isInlineActionPresentationActive,
-                message: message
+                message: message,
+                onReport: { isReportPresented = true }
             )
             // The strip is an overlay on the bubble's edge, pushed clear of it by the width
             // SwiftUI measured — not by a count of the controls kept in step with the row's `if`
@@ -569,6 +585,9 @@ struct MessageBubble: View {
                 + Text(L10n.string("Edited")).wnFont(.medium10)
                 + Text(verbatim: " ")
         }
+        if message.hasFiniteRetentionExpiry {
+            result = result + Text(Image(systemName: "timer")).wnFont(.medium10) + Text(verbatim: " ")
+        }
         result =
             result
             + Text(message.timeLabel(at: timestampReferenceDate, locale: timestampLocale))
@@ -623,6 +642,11 @@ struct MessageBubble: View {
                 Button(L10n.string("Edited")) { workspace.messagePendingEditHistory = message }
                     .buttonStyle(.plain)
                     .help(L10n.string("View edit history"))
+            }
+            if let retentionLabel = message.retentionExpirationLabel(locale: timestampLocale) {
+                Image(systemName: "timer")
+                    .help(retentionLabel)
+                    .accessibilityLabel(retentionLabel)
             }
             Text(message.timeLabel(at: timestampReferenceDate, locale: timestampLocale))
                 .monospacedDigit()
@@ -1067,54 +1091,65 @@ struct MessageMediaAttachmentView: View {
     let isOutgoing: Bool
 
     var body: some View {
-        Group {
-            switch downloadState.state {
-            case .idle, .loading:
-                // Audio keeps the player's shell while it downloads so the row does not reflow
-                // when the payload lands; every other kind still names the file it is fetching.
-                if attachment.kind == .audio {
-                    MessageAudioAttachmentPlaceholder(
-                        isOutgoing: isOutgoing,
-                        accessibilityLabel: attachment.previewLabel
-                    )
-                } else {
-                    MessageAttachmentStatusRow(
-                        systemImage: "arrow.down.circle",
-                        title: attachment.fileName,
-                        detail: attachment.mediaType,
-                        isOutgoing: isOutgoing,
-                        isLoading: true
-                    )
-                }
-            case .loaded(let download):
-                loadedContent(download)
-            case .failed:
-                if attachment.kind == .audio {
-                    MessageAudioAttachmentPlaceholder(
-                        isOutgoing: isOutgoing,
-                        accessibilityLabel: L10n.string("Attachment unavailable")
-                    ) {
-                        Task { await workspace.loadMediaAttachment(attachment, for: message) }
+        if let rejectionMessage = attachment.rejectionMessage {
+            MessageAttachmentStatusRow(
+                systemImage: "exclamationmark.triangle",
+                title: L10n.string("Attachment"),
+                detail: rejectionMessage,
+                isOutgoing: isOutgoing,
+                isLoading: false
+            )
+            .accessibilityIdentifier("message.media.attachment.\(attachment.id)")
+        } else {
+            Group {
+                switch downloadState.state {
+                case .idle, .loading:
+                    // Audio keeps the player's shell while it downloads so the row does not reflow
+                    // when the payload lands; every other kind still names the file it is fetching.
+                    if attachment.kind == .audio {
+                        MessageAudioAttachmentPlaceholder(
+                            isOutgoing: isOutgoing,
+                            accessibilityLabel: attachment.previewLabel
+                        )
+                    } else {
+                        MessageAttachmentStatusRow(
+                            systemImage: "arrow.down.circle",
+                            title: attachment.fileName,
+                            detail: attachment.mediaType,
+                            isOutgoing: isOutgoing,
+                            isLoading: true
+                        )
                     }
-                } else {
-                    MessageAttachmentStatusRow(
-                        systemImage: "exclamationmark.triangle",
-                        title: attachment.fileName,
-                        detail: L10n.string("Attachment unavailable"),
-                        isOutgoing: isOutgoing,
-                        isLoading: false
-                    ) {
-                        Task { await workspace.loadMediaAttachment(attachment, for: message) }
+                case .loaded(let download):
+                    loadedContent(download)
+                case .failed:
+                    if attachment.kind == .audio {
+                        MessageAudioAttachmentPlaceholder(
+                            isOutgoing: isOutgoing,
+                            accessibilityLabel: L10n.string("Attachment unavailable")
+                        ) {
+                            Task { await workspace.loadMediaAttachment(attachment, for: message) }
+                        }
+                    } else {
+                        MessageAttachmentStatusRow(
+                            systemImage: "exclamationmark.triangle",
+                            title: attachment.fileName,
+                            detail: L10n.string("Attachment unavailable"),
+                            isOutgoing: isOutgoing,
+                            isLoading: false
+                        ) {
+                            Task { await workspace.loadMediaAttachment(attachment, for: message) }
+                        }
                     }
                 }
             }
+            .autoDownloadMediaAttachment(
+                downloadState,
+                attachment: attachment,
+                message: message
+            )
+            .accessibilityIdentifier("message.media.attachment.\(attachment.id)")
         }
-        .autoDownloadMediaAttachment(
-            downloadState,
-            attachment: attachment,
-            message: message
-        )
-        .accessibilityIdentifier("message.media.attachment.\(attachment.id)")
     }
 
     @ViewBuilder
@@ -2106,6 +2141,7 @@ struct MessageInlineActions: View {
     @State private var isOverflowPresented = false
     @Binding var isPresentationActive: Bool
     let message: MessageItem
+    let onReport: () -> Void
 
     var body: some View {
         HStack(spacing: 4) {
@@ -2155,9 +2191,11 @@ struct MessageInlineActions: View {
                 }
                 .buttonStyle(.plain)
                 .popover(isPresented: $isOverflowPresented, arrowEdge: .bottom) {
-                    MessageOverflowPopover(message: message) {
-                        isOverflowPresented = false
-                    }
+                    MessageOverflowPopover(
+                        message: message,
+                        onReport: onReport,
+                        dismiss: { isOverflowPresented = false }
+                    )
                 }
                 .help(L10n.string("More"))
             }
@@ -2276,7 +2314,7 @@ struct MessageEmojiPickerPopover: View {
 /// (`MessageOverflowPopover`) — share one source of truth for which actions exist and what
 /// they do, while each keeps its own button styling.
 struct MessageRowAction: Identifiable {
-    enum Kind { case retry, info, select, forward, edit, copy, delete }
+    enum Kind { case retry, info, select, forward, edit, copy, report, delete }
 
     let kind: Kind
     let title: String
@@ -2294,6 +2332,7 @@ struct MessageRowAction: Identifiable {
         for message: MessageItem,
         workspace: WorkspaceState,
         now: Date = .now,
+        report: (() -> Void)? = nil,
         dismiss: @escaping () -> Void = {}
     ) -> [MessageRowAction] {
         var actions: [MessageRowAction] = []
@@ -2344,6 +2383,18 @@ struct MessageRowAction: Identifiable {
                 MessageRowAction(kind: .copy, title: L10n.string("Copy Text"), systemImage: "doc.on.doc", role: nil) {
                     workspace.copyText(of: message)
                     dismiss()
+                })
+        }
+        if message.canReport, let report {
+            actions.append(
+                MessageRowAction(
+                    kind: .report,
+                    title: L10n.string("Report"),
+                    systemImage: "exclamationmark.bubble",
+                    role: nil
+                ) {
+                    dismiss()
+                    report()
                 })
         }
         if workspace.canDeleteMessage(message) {
@@ -2412,10 +2463,18 @@ struct MessageRowAction: Identifiable {
 struct MessageOverflowPopover: View {
     @Environment(WorkspaceState.self) private var workspace
     let message: MessageItem
+    let onReport: () -> Void
     let dismiss: () -> Void
 
     var body: some View {
-        MessageOverflowMenu(actions: MessageRowAction.all(for: message, workspace: workspace, dismiss: dismiss))
+        MessageOverflowMenu(
+            actions: MessageRowAction.all(
+                for: message,
+                workspace: workspace,
+                report: onReport,
+                dismiss: dismiss
+            )
+        )
     }
 }
 
@@ -2471,6 +2530,7 @@ struct MessageOverflowMenu: View {
 struct MessageContextMenuItems: View {
     @Environment(WorkspaceState.self) private var workspace
     let message: MessageItem
+    let onReport: () -> Void
 
     var body: some View {
         Group {
@@ -2504,7 +2564,7 @@ struct MessageContextMenuItems: View {
                 Divider()
             }
 
-            ForEach(MessageRowAction.all(for: message, workspace: workspace)) { action in
+            ForEach(MessageRowAction.all(for: message, workspace: workspace, report: onReport)) { action in
                 Button(role: action.role, action: action.run) {
                     Label(action.title, systemImage: action.systemImage)
                 }

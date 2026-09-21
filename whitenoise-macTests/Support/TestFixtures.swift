@@ -67,6 +67,7 @@ func searchResult(
         accountIdHex: discoveryHex(seed),
         npub: "npub1\(seed.prefix(8))",
         radius: radius,
+        isFollowedBySearcher: false,
         matchedField: matchedField,
         matchQuality: matchQuality,
         providerRank: providerRank,
@@ -88,6 +89,7 @@ func userSearchUpdate(
     UserSearchUpdateFfi(
         trigger: trigger,
         newResults: results,
+        updatedResults: [],
         totalResultCount: UInt32(results.count)
     )
 }
@@ -191,49 +193,370 @@ func awaitSubscriptionCancellation<T>() async -> T? {
     return nil
 }
 
-final class FakeChatListSubscription: ChatListSubscription, @unchecked Sendable {
-    private let rows: [ChatListRowFfi]
-    private var updates: [ChatListSubscriptionUpdateFfi]
-    private let endsWhenExhausted: Bool
-    private let recordSnapshot: () -> Void
+enum FakeAgentPublisherError: Error {
+    case finishFailed
+}
+
+/// Test-only opaque publisher. It records the typed transcript while preserving the same handle
+/// across final-send retries, matching the contract of the Rust-owned publisher object.
+final class FakeAgentTextPublisher: AgentTextPublisher, @unchecked Sendable {
+    private let lock = NSLock()
+    private let publisherInfo: PublisherInfoFfi
+    private var acknowledgements: [PublisherAckFfi]
+    private var finishResults: [Result<SendSummaryFfi, Error>]
+    private var appendedStorage: [AgentPublicationRecord] = []
+    private var cancelCountStorage = 0
+    private var finishCountStorage = 0
 
     required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-        self.rows = []
-        self.updates = []
-        self.endsWhenExhausted = true
-        self.recordSnapshot = {}
+        publisherInfo = PublisherInfoFfi(streamIdHex: "", startMessageIdHex: "")
+        acknowledgements = []
+        finishResults = []
         super.init(unsafeFromRawPointer: pointer)
     }
 
     init(
-        rows: [ChatListRowFfi],
-        updates: [ChatListSubscriptionUpdateFfi] = [],
-        endsWhenExhausted: Bool = false,
-        recordSnapshot: @escaping () -> Void = {}
+        info: PublisherInfoFfi,
+        acknowledgements: [PublisherAckFfi],
+        finishResults: [Result<SendSummaryFfi, Error>]
     ) {
-        self.rows = rows
+        publisherInfo = info
+        self.acknowledgements = acknowledgements
+        self.finishResults = finishResults
+        super.init(noPointer: NoPointer())
+    }
+
+    var appended: [AgentPublicationRecord] {
+        lock.withLock { appendedStorage }
+    }
+
+    var cancelCount: Int {
+        lock.withLock { cancelCountStorage }
+    }
+
+    var finishCount: Int {
+        lock.withLock { finishCountStorage }
+    }
+
+    override func info() -> PublisherInfoFfi {
+        publisherInfo
+    }
+
+    override func append(kind: PublisherRecordFfi, text: String) async throws -> PublisherAckFfi {
+        try lock.withLock {
+            appendedStorage.append(AgentPublicationRecord(kind: kind, text: text))
+            guard !acknowledgements.isEmpty else { throw FakeMarmotRuntimeError.unused }
+            return acknowledgements.removeFirst()
+        }
+    }
+
+    override func finish() async throws -> SendSummaryFfi {
+        try lock.withLock {
+            finishCountStorage += 1
+            guard !finishResults.isEmpty else { throw FakeMarmotRuntimeError.unused }
+            return try finishResults.removeFirst().get()
+        }
+    }
+
+    override func cancel() async {
+        lock.withLock { cancelCountStorage += 1 }
+    }
+}
+
+final class FakePresentedChatListSubscription: PresentedChatListSubscription, @unchecked Sendable {
+    private let initial: PresentedChatListUpdateFfi?
+    private var updates: [PresentedChatListUpdateFfi]
+    private let endsWhenExhausted: Bool
+    private let recordSnapshot: @Sendable () -> Void
+
+    required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        initial = nil
+        updates = []
+        endsWhenExhausted = false
+        recordSnapshot = {}
+        super.init(unsafeFromRawPointer: pointer)
+    }
+
+    init(
+        initial: PresentedChatListUpdateFfi,
+        updates: [PresentedChatListUpdateFfi] = [],
+        endsWhenExhausted: Bool = false,
+        recordSnapshot: @escaping @Sendable () -> Void = {}
+    ) {
+        self.initial = initial
         self.updates = updates
         self.endsWhenExhausted = endsWhenExhausted
         self.recordSnapshot = recordSnapshot
         super.init(noPointer: NoPointer())
     }
 
-    override func snapshot() -> [ChatListRowFfi] {
+    override func snapshot() -> PresentedChatListUpdateFfi? {
         recordSnapshot()
-        return rows
+        return initial
     }
 
-    override func next() async -> ChatListRowFfi? {
-        if endsWhenExhausted { return nil }
-        return await awaitSubscriptionCancellation()
-    }
-
-    override func nextUpdate() async -> ChatListSubscriptionUpdateFfi? {
+    override func next() async throws -> PresentedChatListUpdateFfi? {
         guard !updates.isEmpty else {
             if endsWhenExhausted { return nil }
             return await awaitSubscriptionCancellation()
         }
         return updates.removeFirst()
+    }
+}
+
+final class FakeChatListWindowSubscription: ChatListWindowSubscription, @unchecked Sendable {
+    private var current: ChatListWindowSnapshotFfi?
+    private var updates: [ChatListWindowSnapshotFfi]
+    private var pages: [ChatListWindowSnapshotFfi]
+
+    required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        current = nil
+        updates = []
+        pages = []
+        super.init(unsafeFromRawPointer: pointer)
+    }
+
+    init(
+        initial: ChatListWindowSnapshotFfi,
+        updates: [ChatListWindowSnapshotFfi] = [],
+        pages: [ChatListWindowSnapshotFfi] = []
+    ) {
+        current = initial
+        self.updates = updates
+        self.pages = pages
+        super.init(noPointer: NoPointer())
+    }
+
+    override func snapshot() -> ChatListWindowSnapshotFfi? {
+        current
+    }
+
+    override func next() async throws -> ChatListWindowSnapshotFfi? {
+        guard !updates.isEmpty else { return await awaitSubscriptionCancellation() }
+        let next = updates.removeFirst()
+        current = next
+        return next
+    }
+
+    override func page(sequence: UInt64, direction: ChatListPageDirectionFfi, count: UInt32) async throws
+        -> ChatListWindowSnapshotFfi
+    {
+        guard let current else { throw FakeMarmotRuntimeError.unused }
+        guard !pages.isEmpty else { return current }
+        let next = pages.removeFirst()
+        self.current = next
+        return next
+    }
+
+    override func returnToTop(sequence: UInt64) async throws -> ChatListWindowSnapshotFfi {
+        guard let current else { throw FakeMarmotRuntimeError.unused }
+        return current
+    }
+
+    override func setVisibleAnchor(sequence: UInt64, groupIdHex: String) async throws -> ChatListWindowSnapshotFfi {
+        guard let current else { throw FakeMarmotRuntimeError.unused }
+        return current
+    }
+}
+
+final class FakeAccountAttentionSubscription: AccountAttentionSubscription, @unchecked Sendable {
+    private let initial: AccountAttentionSnapshotFfi?
+    private var updates: [AccountAttentionSnapshotFfi]
+
+    required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        initial = nil
+        updates = []
+        super.init(unsafeFromRawPointer: pointer)
+    }
+
+    init(initial: AccountAttentionSnapshotFfi, updates: [AccountAttentionSnapshotFfi] = []) {
+        self.initial = initial
+        self.updates = updates
+        super.init(noPointer: NoPointer())
+    }
+
+    override func snapshot() -> AccountAttentionSnapshotFfi? {
+        initial
+    }
+
+    override func next() async throws -> AccountAttentionSnapshotFfi? {
+        guard !updates.isEmpty else { return await awaitSubscriptionCancellation() }
+        return updates.removeFirst()
+    }
+}
+
+final class FakeConversationWindowSubscription: ConversationWindowSubscription, @unchecked Sendable {
+    private var current: ConversationWindowSnapshotFfi?
+    private var updates: [ConversationWindowSnapshotFfi]
+    private let updateDelayNanoseconds: UInt64
+    private(set) var cancelled = false
+
+    required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        current = nil
+        updates = []
+        updateDelayNanoseconds = 0
+        super.init(unsafeFromRawPointer: pointer)
+    }
+
+    init(
+        initial: ConversationWindowSnapshotFfi,
+        updates: [ConversationWindowSnapshotFfi] = [],
+        updateDelayNanoseconds: UInt64 = 0
+    ) {
+        current = initial
+        self.updates = updates
+        self.updateDelayNanoseconds = updateDelayNanoseconds
+        super.init(noPointer: NoPointer())
+    }
+
+    override func cancel() async {
+        cancelled = true
+    }
+
+    override func snapshot() -> ConversationWindowSnapshotFfi? {
+        current
+    }
+
+    override func next() async throws -> ConversationWindowSnapshotFfi? {
+        guard !updates.isEmpty else { return await awaitSubscriptionCancellation() }
+        if updateDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: updateDelayNanoseconds)
+        }
+        guard !Task.isCancelled, !cancelled else { throw CancellationError() }
+        let next = updates.removeFirst()
+        current = next
+        return next
+    }
+
+    override func jumpToMessage(
+        revision: ConversationWindowRevisionFfi,
+        messageIdHex: String,
+        timeoutMs: UInt32
+    ) async throws -> ConversationWindowSnapshotFfi {
+        guard let current else { throw FakeMarmotRuntimeError.unused }
+        return current
+    }
+
+    override func page(
+        revision: ConversationWindowRevisionFfi,
+        direction: ConversationPageDirectionFfi,
+        count: UInt32,
+        timeoutMs: UInt32
+    ) async throws -> ConversationWindowSnapshotFfi {
+        guard let current else { throw FakeMarmotRuntimeError.unused }
+        return current
+    }
+
+    override func returnToLatest(
+        revision: ConversationWindowRevisionFfi,
+        timeoutMs: UInt32
+    ) async throws -> ConversationWindowSnapshotFfi {
+        guard let current else { throw FakeMarmotRuntimeError.unused }
+        return current
+    }
+
+    override func setVisibleAnchor(
+        revision: ConversationWindowRevisionFfi,
+        messageIdHex: String,
+        timeoutMs: UInt32
+    ) async throws -> ConversationWindowSnapshotFfi {
+        guard let current else { throw FakeMarmotRuntimeError.unused }
+        return current
+    }
+}
+
+final class FakeAttachmentTransferSubscription: AttachmentTransferSubscription, @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshots: [AttachmentTransferSnapshotFfi]
+    private let updateDelayNanoseconds: UInt64
+    private(set) var cancelled = false
+
+    required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        snapshots = []
+        updateDelayNanoseconds = 0
+        super.init(unsafeFromRawPointer: pointer)
+    }
+
+    init(snapshots: [AttachmentTransferSnapshotFfi], updateDelayNanoseconds: UInt64 = 0) {
+        self.snapshots = snapshots
+        self.updateDelayNanoseconds = updateDelayNanoseconds
+        super.init(noPointer: NoPointer())
+    }
+
+    override func cancel() {
+        lock.withLock { cancelled = true }
+    }
+
+    override func next() async throws -> AttachmentTransferSnapshotFfi? {
+        if updateDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: updateDelayNanoseconds)
+        }
+        try Task.checkCancellation()
+        return lock.withLock { () -> AttachmentTransferSnapshotFfi? in
+            guard !cancelled, !snapshots.isEmpty else { return nil }
+            return snapshots.removeFirst()
+        }
+    }
+}
+
+final class FakeBlockListSubscription: BlockListSubscription, @unchecked Sendable {
+    private var current: BlockListSnapshotFfi?
+    private var updates: [BlockListSnapshotFfi]
+
+    required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        current = nil
+        updates = []
+        super.init(unsafeFromRawPointer: pointer)
+    }
+
+    init(initial: BlockListSnapshotFfi, updates: [BlockListSnapshotFfi]) {
+        current = initial
+        self.updates = updates
+        super.init(noPointer: NoPointer())
+    }
+
+    override func snapshot() -> BlockListSnapshotFfi? { current }
+
+    override func next() async -> BlockListSnapshotFfi? {
+        guard !updates.isEmpty else { return await awaitSubscriptionCancellation() }
+        let replacement = updates.removeFirst()
+        current = replacement
+        return replacement
+    }
+}
+
+final class FakeOnboardingSubscription: OnboardingSubscription, @unchecked Sendable {
+    private var current: OnboardingSnapshotFfi
+    private var updates: [OnboardingSnapshotFfi]
+
+    required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        current = OnboardingSnapshotFfi(
+            accountIdHex: "",
+            recoveryEpoch: nil,
+            revision: 0,
+            ready: false,
+            steps: [],
+            proposal: nil,
+            singleDeviceNotice: nil,
+            cancellationPending: false
+        )
+        updates = []
+        super.init(unsafeFromRawPointer: pointer)
+    }
+
+    init(initial: OnboardingSnapshotFfi, updates: [OnboardingSnapshotFfi]) {
+        current = initial
+        self.updates = updates
+        super.init(noPointer: NoPointer())
+    }
+
+    override func snapshot() -> OnboardingSnapshotFfi { current }
+
+    override func next() async -> OnboardingSnapshotFfi? {
+        guard !updates.isEmpty else { return await awaitSubscriptionCancellation() }
+        let replacement = updates.removeFirst()
+        current = replacement
+        return replacement
     }
 }
 
@@ -812,6 +1135,7 @@ func isolated(_ text: String) -> String {
 
 func timelineMessage(
     id: String,
+    clientToken: String? = nil,
     sourceMessageIdHex: String? = nil,
     direction: String = "inbound",
     groupIdHex: String,
@@ -832,6 +1156,7 @@ func timelineMessage(
     invalidationStatus: String? = nil
 ) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi(
+        clientToken: clientToken,
         messageIdHex: id,
         sourceMessageIdHex: sourceMessageIdHex,
         direction: direction,
@@ -867,6 +1192,9 @@ func groupSystemEvent(
     newRetentionSeconds: UInt64? = nil
 ) -> GroupSystemEventFfi {
     GroupSystemEventFfi(
+        provenance: .authenticatedGroupState,
+        actorDisplayName: nil,
+        subjectDisplayName: nil,
         systemType: systemType,
         text: text,
         actorAccountIdHex: actorAccountIdHex,
@@ -985,26 +1313,6 @@ func pendingInviteChatItem(
         unreadCount: 0,
         pendingConfirmation: true,
         selfMembership: selfMembership
-    )
-}
-
-/// The same invitation as a raw projection row, for the accounts read one-shot rather than
-/// subscribed to.
-func pendingInviteRow(
-    groupIdHex: String,
-    pendingConfirmation: Bool = true,
-    archived: Bool = false,
-    selfMembership: SelfMembershipFfi = .member
-) -> ChatListRowFfi {
-    chatListRow(
-        groupIdHex: groupIdHex,
-        title: "Invite \(groupIdHex)",
-        preview: "",
-        sender: unreadBadgeFixtureAccountIdHex,
-        timelineAt: 1_700_000_000,
-        selfMembership: selfMembership,
-        archived: archived,
-        pendingConfirmation: pendingConfirmation
     )
 }
 
@@ -1285,90 +1593,6 @@ func notificationUpdate(
     )
 }
 
-let unreadBadgeFixtureAccountIdHex =
-    "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-
-/// A second signed-in account for the rail, distinct from `unreadBadgeFixture`'s active one.
-func backupAccountSummary() -> AccountSummaryFfi {
-    AccountSummaryFfi(
-        label: "Backup Account",
-        accountIdHex: "1111111111111111111111111111111111111111111111111111111111111111",
-        localSigning: true,
-        externalSigning: false,
-        signedOut: false,
-        running: true
-    )
-}
-
-/// A workspace wired to a runtime and one seeded chat, deliberately **without** `bootstrap()`.
-///
-/// Tests that count summary queries or park one mid-flight cannot bootstrap: it returns while the
-/// chat-list enrichment task it spawned is still running (and, with messages installed, timeline
-/// work too), and that task re-upserts rows from the bootstrap snapshot. Either lands inside the
-/// measurement window on a loaded machine — which is how the count guard here failed in CI while
-/// passing 25 runs in a row locally.
-@MainActor
-func unreadBadgeFixture(
-    runtime: FakeMarmotRuntime,
-    seededUnreadCount: Int,
-    additionalChats: [ChatItem] = [],
-    archivedChats: [ChatItem] = [],
-    localNotificationCenter: (any LocalNotificationCenter)? = nil
-) -> (state: WorkspaceState, account: AccountItem) {
-    let account = AccountItem(
-        id: "Desktop Account",
-        accountRef: "Desktop Account",
-        displayName: "Desktop Account",
-        accountIdHex: unreadBadgeFixtureAccountIdHex
-    )
-    let chat = chatListOrderingTestItem(
-        id: "group",
-        title: "Test Group",
-        updatedAt: 1_700_000_000,
-        unreadCount: seededUnreadCount
-    )
-    let state = WorkspaceState(
-        accounts: [account],
-        chatsByAccount: [account.id: [chat] + additionalChats],
-        localNotificationCenter: localNotificationCenter,
-        clientFactory: { runtime }
-    )
-    state.client = runtime
-    state.activeAccountId = account.id
-    if !archivedChats.isEmpty {
-        state.setArchivedChats(archivedChats, forAccountId: account.id)
-    }
-    return (state, account)
-}
-
-/// A delta for the fixture's seeded chat, carrying only a fresh timestamp, unread count, and
-/// archive flag.
-func unreadBadgeFixtureRow(
-    timelineAt: UInt64,
-    unreadCount: UInt64,
-    archived: Bool = false
-) -> ChatListRowFfi {
-    chatListRow(
-        groupIdHex: "group",
-        title: "Test Group",
-        preview: "A newer message",
-        sender: unreadBadgeFixtureAccountIdHex,
-        timelineAt: timelineAt,
-        unreadCount: unreadCount,
-        hasUnread: unreadCount > 0,
-        archived: archived
-    )
-}
-
-func unreadSummaryRow(accountIdHex: String, unreadCount: UInt64) -> AccountUnreadFfi {
-    AccountUnreadFfi(
-        accountIdHex: accountIdHex,
-        unreadCount: unreadCount,
-        unreadConversations: unreadCount > 0 ? 1 : 0,
-        hasUnread: unreadCount > 0
-    )
-}
-
 func desktopAccount() -> AccountSummaryFfi {
     AccountSummaryFfi(
         label: "Desktop Account",
@@ -1391,21 +1615,6 @@ func signedOutBackupAccount() -> AccountSummaryFfi {
         externalSigning: false,
         signedOut: true,
         running: false
-    )
-}
-
-func keyPackageFixture(accountRef: String, eventIdHex: String) -> AccountKeyPackageFfi {
-    AccountKeyPackageFfi(
-        accountRef: accountRef,
-        accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-        keyPackageId: "slot-\(eventIdHex)",
-        keyPackageRefHex: "ref-\(eventIdHex)",
-        eventIdHex: eventIdHex,
-        publishedAt: 1_700_000_000,
-        keyPackageBytes: 512,
-        sourceRelays: MarmotClient.seedRelays,
-        local: true,
-        relay: false
     )
 }
 

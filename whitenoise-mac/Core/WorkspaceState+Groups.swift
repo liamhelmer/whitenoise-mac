@@ -1715,6 +1715,7 @@ extension WorkspaceState {
             invalidateGroupMembers(for: groupIdHex)
         case .newLastMessage,
             .lastMessageDeleted,
+            .lastMessageContentChanged,
             .latestMessageDeliveryChanged,
             .archiveChanged,
             .pendingConfirmationChanged,

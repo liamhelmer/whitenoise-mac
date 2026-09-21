@@ -206,11 +206,9 @@ extension WorkspaceState {
         cancelChatListReload()
         stopChatListListener()
         closeGroupDetails()
-        clearSharedMedia()
         clearEnteredLoginIdentity()
         activeAccountId = account.id
         invalidateNotificationSettingsOperations()
-        invalidatePrivacySecurityOperations()
         UserDefaults.standard.set(account.id, forKey: Self.activeAccountKey)
         chatListFilter = .active
         archivingChatId = nil
@@ -247,7 +245,6 @@ extension WorkspaceState {
         phase = .ready
         await refreshNotificationAuthorizationStatus()
         await loadNotificationSettings()
-        await loadPrivacySecuritySettings()
         await reloadChats()
         startNotificationListener()
         flushPendingDeepLinkIfReady()
@@ -388,15 +385,21 @@ extension WorkspaceState {
         guard let client = await clientForAuthentication() else { return }
 
         do {
-            let summary = try await client.createIdentity(
+            let existingAccountLabels = Set(accounts.map(\.accountRef))
+            let creation = try await client.createIdentityWithProfile(
                 defaultRelays: MarmotClient.seedRelays,
                 bootstrapRelays: MarmotClient.seedRelays
             )
+            // MDK coalesces generated-identity calls while an earlier account is still
+            // publishing. Never activate an existing identity as though this attempt created it.
+            guard !existingAccountLabels.contains(creation.account.label) else {
+                throw MarmotKitError.AccountSetupRetryRequired
+            }
             // `refreshAccounts(preferred:)` commits activeAccountId/UserDefaults
             // and clears selection; wait until start succeeds so a failure keeps
             // the previous ready account intact (#333).
             try await bringRuntimeOnline(client)
-            try await refreshAccounts(preferred: summary)
+            try await refreshAccounts(preferred: creation.account)
             authenticationMode = .landing
             // Read before `activateReadyState()`: it goes `.ready` part-way through, after which a
             // switch from Settings can land on a different identity. See
@@ -426,17 +429,46 @@ extension WorkspaceState {
         guard let client = await clientForAuthentication() else { return }
 
         do {
-            let summary = try await client.login(
-                identity: identity,
+            let options = OnboardingOptionsFfi(
                 defaultRelays: MarmotClient.seedRelays,
-                bootstrapRelays: MarmotClient.seedRelays
+                discoveryRelays: MarmotClient.seedRelays
             )
+            let snapshot: OnboardingSnapshotFfi
+            do {
+                snapshot = try await client.beginOnboarding(nsec: identity, options: options)
+            } catch MarmotKitError.OnboardingActionUnavailable {
+                // Accounts created by an older release may predate the durable checkpoint.
+                // Preserve their established login path; every new import uses onboarding.
+                let summary = try await client.login(
+                    identity: identity,
+                    defaultRelays: MarmotClient.seedRelays,
+                    bootstrapRelays: MarmotClient.seedRelays
+                )
+                try await bringRuntimeOnline(client)
+                try await refreshAccounts(preferred: summary)
+                authenticationMode = .landing
+                let enteredAccountIdHex = activeAccount?.accountIdHex
+                await activateReadyState()
+                presentImprovementsPromptIfNeeded(forEnteredAccountIdHex: enteredAccountIdHex)
+                return
+            }
+            let summaries = try await FFIExecutor.run { try client.listAccounts() }
+            guard let summary = summaries.first(where: { $0.accountIdHex == snapshot.accountIdHex }) else {
+                throw MarmotKitError.OnboardingRequired
+            }
             // `refreshAccounts(preferred:)` commits activeAccountId/UserDefaults
             // and clears selection; wait until start succeeds so a failure keeps
             // the previous ready account intact (#333).
             try await bringRuntimeOnline(client)
             try await refreshAccounts(preferred: summary)
             authenticationMode = .landing
+            guard snapshot.ready, !snapshot.cancellationPending else {
+                // AccountScope restores this durable snapshot and owns every subsequent
+                // command. Keeping the app in onboarding makes termination/relaunch resume
+                // the same checkpoint instead of opening a partially prepared account.
+                phase = .onboarding
+                return
+            }
             // Read before `activateReadyState()`: it goes `.ready` part-way through, after which a
             // switch from Settings can land on a different identity. See
             // `presentImprovementsPromptIfNeeded(forEnteredAccountIdHex:)`.
@@ -604,8 +636,6 @@ extension WorkspaceState {
             clearMediaReferenceResolutionCache(forAccountId: removedAccountId)
             accounts = try await accountItemsFromRuntime(client: client)
             removeChats(forAccountId: removedAccountId)
-            accountUnreadByIdHex[removedAccountIdHex] = nil
-            pendingInviteCountByIdHex[removedAccountIdHex] = nil
 
             // `activeAccountId` may have changed during the await above — e.g. the user
             // selected an account from settings while this removal was in flight. Decide
@@ -634,14 +664,12 @@ extension WorkspaceState {
             if signedInAccounts.isEmpty {
                 activeAccountId = nil
                 invalidateNotificationSettingsOperations()
-                invalidatePrivacySecurityOperations()
                 UserDefaults.standard.removeObject(forKey: Self.activeAccountKey)
                 selection = nil
                 authenticationMode = .landing
                 clearEnteredLoginIdentity()
                 phase = .onboarding
                 notificationSettings = .defaults
-                privacySecuritySettings = .defaults
                 return
             }
 
@@ -672,7 +700,6 @@ extension WorkspaceState {
         cancelTimelineLoad()
         cancelChatListReload()
         stopChatListListener()
-        clearSharedMedia()
         cachedMessageChatIds.removeAll()
         for store in messageTimelineStores.values {
             store.clear()
@@ -689,16 +716,6 @@ extension WorkspaceState {
         RemoteImageLoader.shared.clearCache()
         timelinePagingByChat.removeAll()
         clearConversationMetadata()
-        accountUnreadByIdHex.removeAll()
-        // The recorded signal describes counts that no longer exist; keeping it could suppress
-        // the refresh that repopulates the badges after the next account takes over. Bumping the
-        // generation also drops any answer still in flight, which would otherwise repopulate the
-        // badges the teardown just cleared.
-        lastSummarizedAccountUnread = nil
-        accountUnreadSummaryGeneration &+= 1
-        // The other half of the same badges, and the same reason for the generation bump.
-        pendingInviteCountByIdHex.removeAll()
-        pendingInviteCountGeneration &+= 1
         // Read markers are keyed by groupIdHex; leaving them behind both retains a
         // record of which messages the signed-out identity read and lets a recurring
         // group id suppress the first legitimate read-mark advance after re-login. The
@@ -715,9 +732,6 @@ extension WorkspaceState {
         clearPendingChatDestructiveActions()
         profileDraft = ProfileDraft()
         resetProfileEditingState()
-        keyPackages = []
-        auditLogFiles = []
-        auditLogUploadStatus = nil
     }
 
     private func resetAccountScopedGroupAndNewChatUIState() {
@@ -764,7 +778,6 @@ extension WorkspaceState {
             clearMediaReferenceResolutionCache(forAccountId: account.id)
             accounts = try await accountItemsFromRuntime(client: client)
             removeChats(forAccountId: account.id)
-            await refreshAccountUnreadSummary()
 
             // `activeAccountId` may have changed during the awaits above — e.g. the user
             // selected another account while this sign-out was in flight (account switching
@@ -791,14 +804,12 @@ extension WorkspaceState {
                 // on login, so this identity's chats are still waiting behind its key.
                 activeAccountId = nil
                 invalidateNotificationSettingsOperations()
-                invalidatePrivacySecurityOperations()
                 UserDefaults.standard.removeObject(forKey: Self.activeAccountKey)
                 selection = nil
                 authenticationMode = .landing
                 clearEnteredLoginIdentity()
                 phase = .onboarding
                 notificationSettings = .defaults
-                privacySecuritySettings = .defaults
             }
         } catch {
             if wasActive, activeAccountId == account.id {
@@ -837,174 +848,9 @@ extension WorkspaceState {
                     await loadSettingsData()
                 }
             }
-            await refreshAccountUnreadSummary()
         } catch {
             lastError = error.localizedDescription
         }
-    }
-
-    /// Refresh per-account unread totals without loading each account's full session.
-    func refreshAccountUnreadSummary() async {
-        await refreshAccountUnreadSummary(reflecting: currentAccountUnreadSignal())
-        await refreshPendingInviteCounts()
-    }
-
-    /// Re-read the unanswered-invitation counts behind the non-active accounts' avatar badges.
-    ///
-    /// Deliberately absent from `refreshAccountUnreadSummaryIfChatRowsMovedIt`: that gate fires on
-    /// the *active* account's row deltas, and no delta of its rows can move another account's
-    /// invitations, while its own are counted off those very rows. Every path that can move them —
-    /// a full chat-list reload, an account switch, a sign-in, and a notification landing on a
-    /// background account — goes through `refreshAccountUnreadSummary()` above.
-    ///
-    /// The unread summary answers for every account in one call; invitations have no such
-    /// aggregate in this binding, so each account is read separately. That is the same cost class
-    /// (one local projection read per account, no session load, no network), which is why this is
-    /// kept off the per-read-marker path.
-    private func refreshPendingInviteCounts() async {
-        guard let client else { return }
-        // Same race as the unread summary: two refreshes can be in flight and the FFI answers in
-        // whatever order it finishes, so only the newest request may commit.
-        pendingInviteCountGeneration &+= 1
-        let generation = pendingInviteCountGeneration
-        // The active account is excluded here and answered from its rows; a signed-out account
-        // has no badge count at all, and no rail avatar to hang one on — `signedInAccounts`
-        // leaves it out.
-        let targets = accounts.filter { !$0.signedOut && $0.id != activeAccountId }
-        var counts: [String: Int] = [:]
-        for target in targets {
-            do {
-                let rows = try await FFIExecutor.run {
-                    try client.chatList(accountRef: target.accountRef, includeArchived: false)
-                }
-                counts[target.accountIdHex] = PendingInviteBadgeCount.count(inRows: rows)
-            } catch {
-                // Badges are best-effort: keep this account's previous count rather than dropping
-                // an invitation off the rail because one projection read failed.
-                if let previous = pendingInviteCountByIdHex[target.accountIdHex] {
-                    counts[target.accountIdHex] = previous
-                }
-            }
-        }
-        guard pendingInviteCountGeneration == generation else { return }
-        pendingInviteCountByIdHex = counts
-    }
-
-    /// Re-run the summary only when the active account's own chat rows have moved its unread total.
-    ///
-    /// The avatar badge reads `accountUnreadByIdHex`, which comes from a different backend query
-    /// than the chat-list subscription feeding the rows. Reading a chat updates the rows live but
-    /// left the summary at its pre-read value, so the active account's avatar kept a badge for
-    /// messages it had already read until the next full reload or account switch (the only two
-    /// callers of the summary). Gating on the row-derived signal keeps the badge honest without
-    /// putting an FFI query on every read-marker advance.
-    func refreshAccountUnreadSummaryIfChatRowsMovedIt() async {
-        let signal = currentAccountUnreadSignal()
-        guard signal != lastSummarizedAccountUnread else { return }
-        await refreshAccountUnreadSummary(reflecting: signal)
-    }
-
-    /// Re-run the summary when a notification lands on an account other than the active one.
-    ///
-    /// Only the active account runs a chat-list subscription, so the row deltas that keep its own
-    /// badge honest never arrive for the others. Their avatar badges held whatever the last account
-    /// switch or full reload recorded, which is why incoming messages appeared to count only once
-    /// the user switched to that account.
-    ///
-    /// The active account is deliberately left to the row path: it is the more precise signal, and
-    /// querying here as well would put a second summary read on every message it receives.
-    func refreshAccountUnreadSummaryForBackgroundAccount(receiving update: NotificationUpdateFfi) async {
-        guard let activeAccount, activeAccount.accountIdHex != update.accountIdHex else { return }
-        await refreshAccountUnreadSummary()
-    }
-
-    private func refreshAccountUnreadSummary(reflecting signal: AccountUnreadSignal?) async {
-        guard let client else { return }
-        // Two refreshes can be in flight at once (a read-marker advance and a chat-list reload
-        // race routinely), and the FFI answers in whatever order it finishes. Only the newest
-        // request for the still-active account may commit: a late answer landing last would
-        // restore a pre-read total and — because committing also records its signal — leave the
-        // gate suppressing the very refresh that would correct it.
-        accountUnreadSummaryGeneration &+= 1
-        let generation = accountUnreadSummaryGeneration
-        let requestedAccountId = activeAccountId
-        do {
-            let rows = try await FFIExecutor.run { try client.accountUnreadSummary() }
-            guard accountUnreadSummaryGeneration == generation, activeAccountId == requestedAccountId else {
-                return
-            }
-            accountUnreadByIdHex = Dictionary(
-                rows.map { ($0.accountIdHex, Int(clamping: $0.unreadCount)) },
-                uniquingKeysWith: { lhs, _ in lhs }
-            )
-            // Record the signal captured before the query, not the current one: rows that changed
-            // while it was in flight are not reflected in these totals and must still trigger a
-            // follow-up refresh.
-            lastSummarizedAccountUnread = signal
-        } catch {
-            // Unread badges are best-effort; leave the prior values — and the prior signal, so the
-            // next row change retries — on failure.
-        }
-    }
-
-    /// The active account's aggregate unread state as its own loaded chat rows report it.
-    ///
-    /// This is never what the badge displays (that stays the backend summary, which is the only
-    /// value comparable across accounts); it is the cheap local signal for noticing that the
-    /// displayed summary went stale.
-    func currentAccountUnreadSignal() -> AccountUnreadSignal? {
-        guard let activeAccountId else { return nil }
-        // Unarchived chats only, matching what the summary this guards counts: the core sums
-        // unread over `WHERE row.archived = 0`, so an archived chat's unread messages are not in
-        // the displayed total and a change confined to them cannot move it. Counting them here as
-        // well made archiving invisible to the gate — the row moved from one counted list to the
-        // other, leaving the totals identical — so the badge went on counting a chat the user had
-        // just archived until the next full reload or account switch.
-        let chats = chatsByAccount[activeAccountId] ?? []
-        var totalUnreadCount = 0
-        var unreadChatCount = 0
-        for chat in chats {
-            // A change signal, not a displayed count: wrapping addition keeps a pathological
-            // row total (rows clamp to `Int.max`) from trapping here.
-            totalUnreadCount &+= chat.unreadCount
-            if chat.hasUnread {
-                unreadChatCount += 1
-            }
-        }
-        return AccountUnreadSignal(
-            accountId: activeAccountId,
-            totalUnreadCount: totalUnreadCount,
-            unreadChatCount: unreadChatCount,
-            chatCount: chats.count
-        )
-    }
-
-    /// Aggregate attention count for an account's avatar badge in the rail:
-    /// unread messages plus one for each invitation the account has not answered yet.
-    ///
-    /// An unaccepted invite has no timeline, so it adds nothing to the unread total however long
-    /// it sits there — the badge said "nothing to see" while the chat list was showing an invite.
-    /// Counting it as +1 matches how the core aggregates its own badge attention
-    /// (`attention_only_conversations`) and how the row already presents it.
-    func unreadCount(forAccountIdHex accountIdHex: String) -> Int {
-        let unread = accountUnreadByIdHex[accountIdHex] ?? 0
-        // Wrapping addition: both sides are clamped row totals, so a pathological unread count
-        // must not trap here for the sake of a badge that reads "99+" either way.
-        return unread &+ pendingInviteCount(forAccountIdHex: accountIdHex)
-    }
-
-    /// Unanswered invitations for one account, live for the active account and from the last
-    /// projection read for the others.
-    ///
-    /// The active account is answered from its loaded rows rather than from
-    /// `pendingInviteCountByIdHex`, so accepting or declining an invite — or receiving one —
-    /// moves its badge on the chat-list update that changed the row, with no FFI round trip to
-    /// wait through and no window where the two disagree.
-    func pendingInviteCount(forAccountIdHex accountIdHex: String) -> Int {
-        if let activeAccount, activeAccount.accountIdHex == accountIdHex {
-            return PendingInviteBadgeCount.count(inUnarchived: activeChats)
-        }
-        return pendingInviteCountByIdHex[accountIdHex] ?? 0
     }
 
     func deleteAllData() async {
@@ -1122,7 +968,6 @@ extension WorkspaceState {
         }
         activeAccountId = accounts.first(where: { !$0.signedOut })?.id
         invalidateNotificationSettingsOperations()
-        invalidatePrivacySecurityOperations()
         if let activeAccountId {
             UserDefaults.standard.set(activeAccountId, forKey: Self.activeAccountKey)
         } else {
@@ -1166,14 +1011,13 @@ extension WorkspaceState {
         clearFollows()
         activeAccountId = preferredAccount.id
         invalidateNotificationSettingsOperations()
-        invalidatePrivacySecurityOperations()
         UserDefaults.standard.set(preferredAccount.id, forKey: Self.activeAccountKey)
         invalidateSidebarMessageSearch(clearQuery: true)
         clearAllComposerDrafts()
         selection = nil
     }
 
-    /// Returns once MDK's local account/runtime state is ready. In 0.9.8 relay
+    /// Returns once MDK's local account/runtime state is ready. Relay
     /// activation and catch-up continue asynchronously, so UI readiness no longer
     /// waits on network I/O. `start()` remains idempotent and must be called after
     /// every login/sign-up so newly added accounts get workers and subscriptions.
@@ -1207,12 +1051,6 @@ extension WorkspaceState {
         clearPeerProfileRefreshState()
         clearGroupMemberCache()
         clearConversationMetadata()
-        clearSharedMedia()
-        accountUnreadByIdHex.removeAll()
-        lastSummarizedAccountUnread = nil
-        accountUnreadSummaryGeneration &+= 1
-        pendingInviteCountByIdHex.removeAll()
-        pendingInviteCountGeneration &+= 1
         // "Delete All Local Data" must also evict decoded peer/group avatars held in the
         // process-lifetime decoded-image cache; those images derive from attacker-controlled
         // peer `picture` URLs and would otherwise survive the wipe in memory. See #177.
@@ -1221,15 +1059,10 @@ extension WorkspaceState {
         settingsLoadTask = nil
         settingsLoadAccountId = nil
         settingsLoadGeneration &+= 1
-        privacySecurityLoadTask?.cancel()
-        privacySecurityLoadTask = nil
-        privacySecurityLoadAccountId = nil
-        privacySecurityLoadGeneration &+= 1
         observabilityRuntimeGeneration &+= 1
         observabilityRuntimeConfiguration = nil
         activeAccountId = nil
         invalidateNotificationSettingsOperations()
-        invalidatePrivacySecurityOperations()
         selection = nil
         invalidateSidebarMessageSearch(clearQuery: true)
         isChatListVisible = true
@@ -1248,25 +1081,12 @@ extension WorkspaceState {
         profileDraft = ProfileDraft()
         resetProfileEditingState()
         relaySettings = .defaults
-        keyPackages = []
         notificationSettings = .defaults
         notificationAuthorizationStatus = .notDetermined
-        privacySecuritySettings = .defaults
-        auditLogFiles = []
-        auditLogUploadStatus = nil
         isLoadingSettings = false
         isSavingProfile = false
         isRemovingAccount = false
-        isSavingRelays = false
-        isPublishingKeyPackage = false
-        isRepublishingKeyPackage = false
         isSavingNotifications = false
-        isSavingPrivacySecurity = false
-        isLoadingAuditLogFiles = false
-        shouldReloadAuditLogFilesAfterCurrentLoad = false
-        isDeletingAuditLogFiles = false
-        isUploadingAuditLogFiles = false
-        deletingKeyPackageId = nil
         resetAccountScopedGroupAndNewChatUIState()
         self.storageRootPath = storageRootPath
         timelinePagingByChat = [:]

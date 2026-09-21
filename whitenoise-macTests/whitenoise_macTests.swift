@@ -501,11 +501,16 @@ struct whitenoise_macTests: WorkspaceTestSupport {
         let state = WorkspaceState(clientFactory: { runtime })
 
         await state.bootstrap()
+        let accountItem = try #require(state.activeAccount)
+        let baseline = runtime.chatListSubscriptionCount
+        let model = ChatListViewModel(account: accountItem, runtime: runtime)
+        model.start()
         let didRestart = await waitFor {
-            runtime.chatListSubscriptionCount >= 2
+            runtime.chatListSubscriptionCount >= baseline + 2
         }
 
         #expect(didRestart)
+        model.stop()
         await state.deleteAllData()
     }
 
@@ -1010,7 +1015,7 @@ struct whitenoise_macTests: WorkspaceTestSupport {
 }
 
 @Suite(.serialized)
-struct MarmotKit098IntegrationTests {
+struct MarmotKit0104IntegrationTests {
     @MainActor
     @Test func legacyMediaOnlyPreviewStillUsesAttachmentFallback() async throws {
         let row = chatListRow(
@@ -1189,7 +1194,7 @@ struct MarmotKit098IntegrationTests {
     }
 
     @MainActor
-    @Test func chatPreferenceActionsCall098RuntimeSurface() async throws {
+    @Test func chatPreferenceActionsCallCurrentRuntimeSurface() async throws {
         let runtime = FakeMarmotRuntime(accounts: [desktopAccount()])
         runtime.installGroups([messageGroup()])
         let state = WorkspaceState(clientFactory: { runtime })

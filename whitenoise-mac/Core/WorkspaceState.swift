@@ -53,7 +53,8 @@ final class WorkspaceState {
         let buildConfig: TelemetryBuildConfig
         let accountLabel: String?
         let relayTelemetryRuntimeConfig: RelayTelemetryRuntimeConfigFfi
-        let auditLogTrackerConfig: AuditLogTrackerConfigFfi
+        let auditLogTrackerConfig: AuditLogTrackerConfigV4Ffi
+        let productAnalyticsRuntimeConfig: ProductAnalyticsRuntimeConfigFfi
     }
 
     struct FilteredChatsCache {
@@ -360,20 +361,16 @@ final class WorkspaceState {
     /// Bumped per check so a slow fetch resuming after a newer one cannot write a stale verdict.
     var profileNostrAddressCheckGeneration = 0
     var relaySettings = RelaySettingsSnapshot.defaults
-    var keyPackages: [KeyPackageItem] = []
     var notificationSettings = NotificationSettingsSnapshot.defaults
     var notificationAuthorizationStatus: LocalNotificationAuthorizationStatus = .notDetermined
-    var privacySecuritySettings = PrivacySecuritySettingsSnapshot.defaults
-    var auditLogFiles: [AuditLogFileFfi] = []
-    var auditLogUploadStatus: String?
     var developerMode: Bool {
         didSet {
             UserDefaults.standard.set(developerMode, forKey: Self.developerModeKey)
-            // Key Packages hangs off the Developer mode page and appears there only while this
-            // is on, so turning it off — from a second window, since the toggle itself lives on
-            // the parent page — would strand a reader on a page nothing routes to any more. The
-            // page hands itself back to the one that owns it.
-            if !developerMode, selection == .settings(.keyPackages) {
+            // Technical destinations hang off Developer mode and appear there only while this is
+            // on, so turning it off from a second window must not strand their readers.
+            if !developerMode,
+                selection == .settings(.keyPackages) || selection == .settings(.quarantinedGroups)
+            {
                 selection = .settings(.developerMode)
             }
         }
@@ -430,32 +427,8 @@ final class WorkspaceState {
     var isAccountMutationInProgress: Bool {
         isRemovingAccount || isSigningOutAccount || isDeletingAllData
     }
-    /// Per-account unread totals keyed by `accountIdHex`, for the rail's avatar badges.
-    var accountUnreadByIdHex: [String: Int] = [:]
-    /// The active account's row-derived unread signal at the time `accountUnreadByIdHex` was
-    /// last refreshed, so the summary is only re-queried once the rows actually move it.
-    @ObservationIgnored var lastSummarizedAccountUnread: AccountUnreadSignal?
-    /// Bumped per summary request so only the newest one may commit its answer.
-    @ObservationIgnored var accountUnreadSummaryGeneration: UInt64 = 0
-    /// Unanswered invitations per account, keyed by `accountIdHex`, for the same avatar badges.
-    ///
-    /// Holds only the accounts that are **not** active: the active account's invitations are
-    /// counted off its live chat rows instead (`pendingInviteCount(forAccountIdHex:)`), which
-    /// answers without an FFI hop and cannot go stale between refreshes.
-    var pendingInviteCountByIdHex: [String: Int] = [:]
-    /// Bumped per invitation-count request so only the newest one may commit its answer.
-    @ObservationIgnored var pendingInviteCountGeneration: UInt64 = 0
-    var isSavingRelays = false
-    var isPublishingKeyPackage = false
-    var isRepublishingKeyPackage = false
     var isSavingNotifications = false
-    var isSavingPrivacySecurity = false
-    var isLoadingAuditLogFiles = false
-    @ObservationIgnored var shouldReloadAuditLogFilesAfterCurrentLoad = false
-    var isDeletingAuditLogFiles = false
-    var isUploadingAuditLogFiles = false
     var isDeletingAllData = false
-    var deletingKeyPackageId: String?
     var isNewChatComposerVisible = false
     var composePane: ComposePane = .newChat
     var composeContacts: [ComposeContact] = []
@@ -595,20 +568,6 @@ final class WorkspaceState {
     /// a follow/unfollow publishes. A read that resolved against an older epoch is stale by
     /// definition, however recent its own request generation is, and must not be written back.
     @ObservationIgnored var followCacheEpoch: UInt64 = 0
-    /// Shared-media browser state for the group-details sheet.
-    var sharedMediaProjection = GroupSharedMediaProjection.empty
-    var sharedMediaGroupId: String?
-    var sharedMediaError: String?
-    var isLoadingSharedMedia = false
-    /// Monotonic generation so a superseded `loadSharedMedia` can't clear the spinner or publish a
-    /// stale result/error into a newer load's state.
-    @ObservationIgnored var sharedMediaLoadGeneration: UInt64 = 0
-    /// Decrypted shared-media bytes keyed by account+group+plaintext-hash, with an insertion-order
-    /// list and running byte total bounding eviction. `@ObservationIgnored` — views read via the
-    /// async loader, not by observing this.
-    @ObservationIgnored var sharedMediaThumbnailCache: [String: Data] = [:]
-    @ObservationIgnored var sharedMediaThumbnailCacheOrder: [String] = []
-    @ObservationIgnored var sharedMediaThumbnailCacheBytes = 0
     var conversationMetadataByChat: [String: ConversationMetadata] = [:]
     @ObservationIgnored var conversationMetadataGenerationByChat: [String: UInt64] = [:]
     /// Process-wide source for per-chat metadata ownership tokens. Tokens never restart when a
@@ -761,8 +720,6 @@ final class WorkspaceState {
     /// Blocking FFI can resume after cancellation, so the generation is checked before publishing.
     var observabilityRuntimeGeneration: UInt64 = 0
     var notificationTask: Task<Void, Never>?
-    var chatListTask: Task<Void, Never>?
-    var chatListTaskAccountId: String?
     /// Single-owner coalescing for full chat-list reloads (issue #210). `reloadChats()` is
     /// reachable from independently-spawned tasks (account switch, notification taps, group
     /// mutations), so two same-account calls should usually share the in-flight
@@ -800,25 +757,10 @@ final class WorkspaceState {
     /// wraparound, and wrapping avoids overflow traps (issue #182). See `loadSettingsData` /
     /// issue #4.
     var settingsLoadGeneration: UInt64 = 0
-    /// Coalesces the privacy/security subset, which is also loaded during ready-state activation
-    /// outside the aggregate settings task.
-    var privacySecurityLoadTask: Task<Void, Never>?
-    var privacySecurityLoadAccountId: String?
-    var privacySecurityLoadGeneration: UInt64 = 0
     /// Monotonic token for notification-settings reads/writes. Unlike `activeAccountId`, this
     /// bumps on every active-account transition, so an older A request cannot commit after a rapid
     /// A→B→A re-entry or after a newer notification load/toggle for the same account.
     var notificationSettingsGeneration: UInt64 = 0
-    /// Monotonic token for privacy/security settings writes. Each setter bumps it on entry, so a
-    /// load whose FFI read resolved before the save committed abandons its stale snapshot instead
-    /// of reverting the just-saved toggle. An active-account transition bumps it too, so a save
-    /// started under the previous identity cannot commit into the new one.
-    var privacySecuritySettingsGeneration: UInt64 = 0
-    /// The account whose save currently holds `isSavingPrivacySecurity`, or `nil` when no save is
-    /// in flight. The flag alone cannot say *whose* save it is, and both the page's loader and
-    /// both setters refuse to run while it is raised — so a save left standing across an account
-    /// switch would lock the new identity's toggles out of a page it never saved on.
-    var privacySecuritySaveAccountId: String?
     var timelineTask: Task<Void, Never>?
     var timelineTaskGroupId: String?
     /// Single-owner coalescing for initial timeline loads (issue #332). `loadMessages` can be
@@ -1838,73 +1780,19 @@ final class WorkspaceState {
             && !isSending
     }
 
-    /// Media messages sent from the selected conversation that are still uploading or publishing,
+    /// Media messages whose durable client token has not appeared in the authoritative projection,
     /// oldest first — the loading bubbles the transcript appends after its real rows.
-    ///
-    /// A message whose blobs are already on screen is withheld even though its publish has not
-    /// returned yet: the core commits an own send locally *inside* that call, so the real row can
-    /// arrive through the timeline subscription while the relay round-trip is still going, and both
-    /// rows would render at once for the length of it. Only in-flight messages are withheld — a
-    /// failed one keeps its bubble so its retry and remove actions stay reachable.
     var selectedPendingOutgoingMediaMessages: [PendingOutgoingMediaMessage] {
         guard let selectedComposerDraftKey else { return [] }
-        let pending = pendingOutgoingMediaMessagesByConversation[selectedComposerDraftKey] ?? []
-        // Nothing has been uploaded yet in the common case, so the timeline is never walked.
-        guard pending.contains(where: { $0.state.isInFlight && !$0.publishedPlaintextSHAs.isEmpty }) else {
-            return pending
-        }
-        let published = publishedOutgoingMediaDigestsInSelectedTimeline
-        return pending.filter { message in
-            guard message.state.isInFlight, !message.publishedPlaintextSHAs.isEmpty else { return true }
-            return !message.publishedPlaintextSHAs.isSubset(of: published)
-        }
+        return pendingOutgoingMediaMessagesByConversation[selectedComposerDraftKey] ?? []
     }
 
-    /// Plaintext digests of every blob the selected transcript already renders as an own send.
-    private var publishedOutgoingMediaDigestsInSelectedTimeline: Set<String> {
-        var digests: Set<String> = []
-        for message in selectedMessages where message.isOutgoing {
-            for attachment in message.mediaAttachments {
-                digests.insert(attachment.reference.plaintextSha256.lowercased())
-            }
-        }
-        return digests
-    }
-
-    /// Text messages sent from the selected conversation that the core has not committed a visible
-    /// row for, oldest first.
-    ///
-    /// A publishing message is withheld once an own row carrying its exact body has appeared since
-    /// the publish began: the core commits an own send locally *inside* that call, so the real row
-    /// arrives while the relay round-trip is still going and the two would otherwise render the
-    /// same sentence twice. Queued and failed messages are never withheld — in both of those states
-    /// this row is the only copy of the message there is.
+    /// Text messages whose durable client token has not appeared in the authoritative projection,
+    /// oldest first. Projection application removes an exact token match; bodies are deliberately
+    /// irrelevant because consecutive messages may contain identical text.
     var selectedPendingOutgoingTextMessages: [PendingOutgoingTextMessage] {
         guard let selectedComposerDraftKey else { return [] }
-        let pending = pendingOutgoingTextMessagesByConversation[selectedComposerDraftKey] ?? []
-        // Nothing is mid-publish in the common case, so the timeline is never walked.
-        guard pending.contains(where: { $0.state == .publishing && $0.ownBodyCountBeforePublish != nil })
-        else { return pending }
-        return pending.filter { message in
-            guard message.state == .publishing, let before = message.ownBodyCountBeforePublish else { return true }
-            return ownBodyCount(of: message.text, inChat: selectedComposerDraftKey.chatId) <= before
-        }
-    }
-
-    /// How many own rows `chatId`'s timeline holds carrying exactly `body`.
-    ///
-    /// Matched on `wireBody` rather than `body`: that is the text handed to the core, before mention
-    /// npubs are resolved back to display names, so it is the same string the pending message holds.
-    ///
-    /// Keyed by chat rather than read off the selection, so the count a publish stamps and the count
-    /// it is later compared against describe the same conversation even if the user navigated away
-    /// mid-round-trip.
-    func ownBodyCount(of body: String, inChat chatId: String) -> Int {
-        messageTimelineStores[chatId]?.messages.reduce(into: 0) { count, message in
-            if message.isOutgoing, message.wireBody == body {
-                count += 1
-            }
-        } ?? 0
+        return pendingOutgoingTextMessagesByConversation[selectedComposerDraftKey] ?? []
     }
 
     /// Both kinds of pending own row in one list, in the order the user sent them — the tail the
@@ -2131,8 +2019,6 @@ final class WorkspaceState {
             cached.buildConfig == config,
             cached.accountLabel == accountLabel
         {
-            privacySecuritySettings.telemetryCredentialsAvailable = config.telemetryCredentialsAvailable
-            privacySecuritySettings.auditLogCredentialsAvailable = config.auditLogCredentialsAvailable
             return
         }
 
@@ -2154,6 +2040,7 @@ final class WorkspaceState {
             relayRuntimeConfig = config.runtimeConfig(installId: installId)
         }
         let auditTrackerConfig = config.auditTrackerConfig()
+        let productAnalyticsRuntimeConfig = config.productAnalyticsRuntimeConfig()
 
         if observabilityRuntimeConfiguration?.relayTelemetryRuntimeConfig != relayRuntimeConfig {
             try await client.setRelayTelemetryRuntimeConfig(config: relayRuntimeConfig)
@@ -2169,16 +2056,23 @@ final class WorkspaceState {
                 activeAccountId == accountId
             else { return }
         }
+        if observabilityRuntimeConfiguration?.productAnalyticsRuntimeConfig != productAnalyticsRuntimeConfig {
+            try await FFIExecutor.run {
+                try client.setProductAnalyticsRuntimeConfig(config: productAnalyticsRuntimeConfig)
+            }
+            guard !Task.isCancelled, observabilityRuntimeGeneration == generation,
+                activeAccountId == accountId
+            else { return }
+        }
 
         guard observabilityRuntimeGeneration == generation, activeAccountId == accountId else { return }
         observabilityRuntimeConfiguration = ObservabilityRuntimeConfiguration(
             buildConfig: config,
             accountLabel: accountLabel,
             relayTelemetryRuntimeConfig: relayRuntimeConfig,
-            auditLogTrackerConfig: auditTrackerConfig
+            auditLogTrackerConfig: auditTrackerConfig,
+            productAnalyticsRuntimeConfig: productAnalyticsRuntimeConfig
         )
-        privacySecuritySettings.telemetryCredentialsAvailable = config.telemetryCredentialsAvailable
-        privacySecuritySettings.auditLogCredentialsAvailable = config.auditLogCredentialsAvailable
     }
 
     var isShowingSettings: Bool {
@@ -2309,23 +2203,5 @@ extension MissingRelayListKindFfi {
         case .inbox: return RelayRole.inbox.label
         @unknown default: return L10n.string("Unknown")
         }
-    }
-}
-
-extension KeyPackageItem {
-    init(package: AccountKeyPackageFfi) {
-        self.init(
-            accountRef: package.accountRef,
-            accountIdHex: package.accountIdHex,
-            keyPackageId: package.keyPackageId,
-            keyPackageRefHex: package.keyPackageRefHex,
-            eventIdHex: package.eventIdHex,
-            publishedAt: package.publishedAt == 0
-                ? nil : Date(timeIntervalSince1970: TimeInterval(package.publishedAt)),
-            keyPackageBytes: package.keyPackageBytes,
-            sourceRelays: package.sourceRelays,
-            isLocal: package.local,
-            isRelayDiscovered: package.relay
-        )
     }
 }

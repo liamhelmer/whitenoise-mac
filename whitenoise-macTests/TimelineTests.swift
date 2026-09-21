@@ -5132,9 +5132,14 @@ struct TimelineTests: WorkspaceTestSupport {
         await state.settlePeerProfileRefreshQueueForTesting()
         #expect(runtime.lastProfileRefreshRelays.contains("wss://old.relay.example"))
 
-        // The user edits their profile relay set in Settings: adds one, drops the old one.
-        await state.addRelay("wss://new.relay.example", roles: [.profile])
-        await state.setRelayRole(.profile, isEnabled: false, forRelay: "wss://old.relay.example")
+        // The account-scoped settings model edits the profile relay set and its app-shell
+        // callback invalidates the legacy profile lookup cache during this staged migration.
+        let relayModel = RelaySettingsViewModel(accountRef: "Desktop Account", runtime: runtime) {
+            state.peerProfileLookupRelaysByAccountId[account.label] = nil
+        }
+        await relayModel.load()
+        await relayModel.addRelay("wss://new.relay.example", roles: [.profile])
+        await relayModel.setRole(.profile, isEnabled: false, forRelay: "wss://old.relay.example")
 
         state.requestPeerProfileRefresh([carolId])
         await state.settlePeerProfileRefreshQueueForTesting()
@@ -5713,8 +5718,9 @@ struct TimelineTests: WorkspaceTestSupport {
         await state.sendDraft()
         await Self.settlePendingOutgoingMediaSends(state)
 
-        // Staging uploaded the blob; sending only published the reference it produced.
-        #expect(runtime.uploadMediaCallCount == 1)
+        // Staging warms the composer preview; Send transfers retained-file ownership to the
+        // atomic tokenized upload-and-admit operation.
+        #expect(runtime.uploadMediaCallCount == 2)
         #expect(runtime.sendMediaAttachmentsCallCount == 1)
         #expect(runtime.replyToMessageCallCount == 0)
         #expect(runtime.repliedMessage == nil)
@@ -5857,8 +5863,9 @@ struct TimelineTests: WorkspaceTestSupport {
         await state.sendDraft()
         await Self.settlePendingOutgoingMediaSends(state)
 
-        // The send publishes the staged reference; it does not upload again.
-        #expect(runtime.uploadMediaCallCount == 1)
+        // Send uses MarmotKit's atomic retained upload and durable admission rather than adopting
+        // the preview upload as a second ownership path.
+        #expect(runtime.uploadMediaCallCount == 2)
         #expect(runtime.sendTextCallCount == 0)
         #expect(runtime.sendMediaAttachmentsCallCount == 1)
         #expect(runtime.sentMediaAttachments.last?.groupIdHex == "direct-group")
@@ -6158,7 +6165,7 @@ struct TimelineTests: WorkspaceTestSupport {
         // gate, which the in-flight message no longer occupies.
         #expect(state.stagedVoiceMessage == nil)
         #expect(state.canRecordVoiceMessage)
-        #expect(runtime.sendMediaAttachmentsCallCount == 0)
+        #expect(runtime.sendMediaAttachmentsCallCount == 1)
         let pending = try #require(state.selectedPendingOutgoingMediaMessages.first)
         #expect(pending.state == .uploading)
         #expect(pending.attachments.first?.isVoiceMessage == true)
@@ -6180,8 +6187,8 @@ struct TimelineTests: WorkspaceTestSupport {
         // reach the transcript through the timeline subscription while the relay round-trip is
         // still in flight. The pending bubble is only dropped once that call returns, so for the
         // length of the publish the same voice note rendered twice — one loading bubble stacked
-        // under the real one. Matching on the uploaded blob's plaintext digest retires the
-        // placeholder as soon as the row it became is on screen.
+        // under the real one. The projected client token retires exactly the placeholder that row
+        // became, without guessing from attachment bytes.
         let account = desktopAccount()
         let runtime = FakeMarmotRuntime(accounts: [account])
         runtime.installGroup(messageGroup())
@@ -6197,25 +6204,24 @@ struct TimelineTests: WorkspaceTestSupport {
         runtime.messageActionGateEnabled = true
         await state.sendDraft()
         await Self.waitUntil { runtime.didReachMessageActionGate }
-        #expect(state.selectedPendingOutgoingMediaMessages.map(\.state) == [.publishing])
+        let pending = try #require(state.selectedPendingOutgoingMediaMessages.first)
+        #expect(pending.state == .uploading)
+        let publishedReference = try #require(runtime.sentMediaAttachments.last?.attachments.first)
 
+        // Matching content is not matching identity. A different token must leave this send's
+        // optimistic row alone even if every attachment byte is identical.
         runtime.installTimelinePage(
             TimelinePageFfi(
                 messages: [
                     timelineMessage(
-                        id: "published-voice",
+                        id: "different-send",
+                        clientToken: "some-other-send",
                         direction: "outbound",
                         groupIdHex: "group",
                         sender: account.accountIdHex,
                         plaintext: "",
-                        recordedAt: 1_700_000_000,
-                        media: [
-                            mediaAttachmentReference(
-                                mediaType: "audio/mp4",
-                                fileName: "voice-note.m4a",
-                                plaintextSha256: hexSHA256(recording.data)
-                            )
-                        ]
+                        recordedAt: 1_699_999_999,
+                        media: [publishedReference]
                     )
                 ],
                 hasMoreBefore: false,
@@ -6229,14 +6235,38 @@ struct TimelineTests: WorkspaceTestSupport {
             account: activeAccount,
             client: runtime
         )
+        #expect(state.selectedPendingOutgoingMediaMessages.map(\.clientToken) == [pending.clientToken])
+
+        runtime.installTimelinePage(
+            TimelinePageFfi(
+                messages: [
+                    timelineMessage(
+                        id: "published-voice",
+                        clientToken: pending.clientToken,
+                        direction: "outbound",
+                        groupIdHex: "group",
+                        sender: account.accountIdHex,
+                        plaintext: "",
+                        recordedAt: 1_700_000_000,
+                        media: [publishedReference]
+                    )
+                ],
+                hasMoreBefore: false,
+                hasMoreAfter: false
+            ),
+            groupIdHex: "group"
+        )
+        await state.refreshSelectedTimelineAfterSend(
+            groupIdHex: "group",
+            account: activeAccount,
+            client: runtime
+        )
 
         // One bubble, not two: the real row is on screen and the loading one is already gone, even
         // though the publish has not returned yet.
         #expect(state.selectedMessages.map(\.id) == ["published-voice"])
         #expect(state.selectedPendingOutgoingMediaMessages.isEmpty)
-        // Hidden, not cancelled — the send still owns the message until its publish returns, which
-        // is what lets a failure put the bubble back with its retry actions.
-        #expect(state.pendingOutgoingMediaMessagesByConversation[draftKey]?.count == 1)
+        #expect(state.pendingOutgoingMediaMessagesByConversation[draftKey] == nil)
 
         runtime.releaseMessageActionGate()
         await Self.settlePendingOutgoingMediaSends(state)
@@ -6270,6 +6300,7 @@ struct TimelineTests: WorkspaceTestSupport {
         runtime.messageActionGateEnabled = true
         await state.sendDraft()
         await Self.waitUntil { runtime.didReachMessageActionGate }
+        let pending = try #require(state.selectedPendingOutgoingMediaMessages.first)
 
         // The row the core commits locally inside the publish carries the reference the send just
         // published, which is what the held plaintext is keyed by.
@@ -6279,6 +6310,7 @@ struct TimelineTests: WorkspaceTestSupport {
                 messages: [
                     timelineMessage(
                         id: "published-photo",
+                        clientToken: pending.clientToken,
                         direction: "outbound",
                         groupIdHex: "group",
                         sender: account.accountIdHex,
@@ -6379,12 +6411,14 @@ struct TimelineTests: WorkspaceTestSupport {
         runtime.messageActionGateEnabled = true
         await state.sendDraft()
         await Self.waitUntil { runtime.didReachMessageActionGate }
+        let pending = try #require(state.selectedPendingOutgoingMediaMessages.first)
 
         let publishedReference = try #require(runtime.sentMediaAttachments.last?.attachments.first)
         let publishedPage = TimelinePageFfi(
             messages: [
                 timelineMessage(
                     id: "published-photo",
+                    clientToken: pending.clientToken,
                     direction: "outbound",
                     groupIdHex: "group",
                     sender: account.accountIdHex,
@@ -6465,7 +6499,7 @@ struct TimelineTests: WorkspaceTestSupport {
             client: runtime
         )
 
-        #expect(state.selectedPendingOutgoingMediaMessages.map(\.state) == [.publishing])
+        #expect(state.selectedPendingOutgoingMediaMessages.map(\.state) == [.uploading])
 
         runtime.releaseMessageActionGate()
         await Self.settlePendingOutgoingMediaSends(state)
@@ -6771,6 +6805,7 @@ struct TimelineTests: WorkspaceTestSupport {
         #expect(state.pendingMediaAttachments.isEmpty)
         #expect(state.draftText.isEmpty)
         let failed = try #require(state.selectedPendingOutgoingMediaMessages.first)
+        let clientToken = failed.clientToken
         #expect(failed.state == .failed)
         #expect(failed.attachments == [attachment])
         #expect(failed.caption == "Project notes")
@@ -6780,8 +6815,9 @@ struct TimelineTests: WorkspaceTestSupport {
         await Self.settlePendingOutgoingMediaSends(state)
 
         // The retry re-uploads rather than trusting a reference whose failure it cannot see.
-        #expect(runtime.uploadMediaCallCount == 2)
+        #expect(runtime.uploadMediaCallCount == 3)
         #expect(runtime.sendMediaAttachmentsCallCount == 2)
+        #expect(runtime.tokenizedMediaSubmissions.map(\.clientToken) == [clientToken, clientToken])
         #expect(state.selectedPendingOutgoingMediaMessages.isEmpty)
     }
 
@@ -7086,6 +7122,7 @@ struct TimelineTests: WorkspaceTestSupport {
         await Self.settlePendingOutgoingMediaSends(state)
 
         let failed = try #require(state.selectedPendingOutgoingMediaMessages.first)
+        let clientToken = failed.clientToken
 
         // Two failed retries, not one: the menu must survive every trip through `.uploading`, not
         // just the first.
@@ -7102,6 +7139,7 @@ struct TimelineTests: WorkspaceTestSupport {
         }
 
         #expect(runtime.sendMediaAttachmentsCallCount == 3)
+        #expect(Set(runtime.tokenizedMediaSubmissions.map(\.clientToken)) == Set([clientToken]))
     }
 
     @MainActor
@@ -7169,7 +7207,7 @@ struct TimelineTests: WorkspaceTestSupport {
         #expect(!state.isSending)
         await Self.waitUntil { runtime.didReachMessageActionGate }
         #expect(runtime.sendMediaAttachmentsCallCount == 1)
-        #expect(state.selectedPendingOutgoingMediaMessages.map(\.state) == [.publishing])
+        #expect(state.selectedPendingOutgoingMediaMessages.map(\.state) == [.uploading])
 
         runtime.releaseMessageActionGate()
         await Self.settlePendingOutgoingMediaSends(state)
@@ -7334,7 +7372,8 @@ struct TimelineTests: WorkspaceTestSupport {
         runtime.replyToMessageError = nil
         state.retryPendingOutgoingTextMessage(failed.id)
         await Self.settlePendingOutgoingTextSends(state)
-        #expect(state.selectedPendingOutgoingTextMessages.isEmpty)
+        #expect(state.selectedPendingOutgoingTextMessages.first?.state == .publishing)
+        #expect(state.selectedPendingOutgoingTextMessages.first?.clientToken == failed.clientToken)
         #expect(runtime.repliedMessage?.text == "@npub1alyce ping")
     }
 
@@ -7374,7 +7413,8 @@ struct TimelineTests: WorkspaceTestSupport {
         // The failed attempt plus one retry. Counted at the top of the fake's `sendText`, ahead of
         // its own error, so a second retry that got as far as the core would be visible here.
         #expect(runtime.sendTextCallCount == 2)
-        #expect(state.selectedPendingOutgoingTextMessages.isEmpty)
+        #expect(state.selectedPendingOutgoingTextMessages.first?.state == .publishing)
+        #expect(state.selectedPendingOutgoingTextMessages.first?.clientToken == failed.clientToken)
     }
 
     @MainActor
@@ -7496,51 +7536,69 @@ struct TimelineTests: WorkspaceTestSupport {
         await Self.settleOutgoingTextSends(state)
 
         #expect(runtime.publishedTexts.map(\.text) == ["first message", "second message"])
-        // Each row retires as its publish lands, so the tail empties on its own.
-        #expect(state.selectedPendingOutgoingTextMessages.isEmpty)
+        // Durable admission is not projection. Both rows keep their distinct stable tokens until
+        // the authoritative conversation snapshot returns them.
+        #expect(state.selectedPendingOutgoingTextMessages.count == 2)
+        #expect(Set(state.selectedPendingOutgoingTextMessages.map(\.clientToken)).count == 2)
     }
 
     @MainActor
-    @Test func aPublishingTextRowIsWithheldOnceItsOwnRowArrives() async throws {
-        // The core commits an own send locally *inside* the publish call, so the real row can reach
-        // the transcript while the relay round-trip is still going. Both rendering would show the
-        // same sentence twice — and the count is taken before the publish so an identical message
-        // already in the conversation cannot pass for this one's arrival.
+    @Test func aPublishingTextRowRetiresOnlyWhenItsClientTokenIsProjected() async throws {
+        // An identical body is not identity. Only the token returned in the authoritative
+        // conversation snapshot may retire this optimistic row.
         let account = desktopAccount()
         let runtime = FakeMarmotRuntime(accounts: [account])
         runtime.installGroup(messageGroup())
         let state = WorkspaceState(clientFactory: { runtime })
         await state.bootstrap()
+        let accountItem = try #require(state.activeAccount)
         let draftKey = try #require(state.selectedComposerDraftKey)
         let chatId = draftKey.chatId
-
-        func ownRow(id: String, body: String) -> MessageItem {
-            MessageItem(
-                id: id,
-                groupIdHex: chatId,
-                sourceMessageIdHex: "source-\(id)",
-                senderAccountIdHex: account.accountIdHex,
-                senderName: "Desktop Account",
-                body: body,
-                sentAt: .now,
-                isOutgoing: true
-            )
-        }
-
-        // An identical message the conversation already contained.
-        state.messageTimelineStores[chatId]?.replace(with: [ownRow(id: "old", body: "ok")])
 
         runtime.messageActionGateEnabled = true
         state.draftText = "ok"
         await state.sendDraft()
         await Self.waitUntil { runtime.didReachMessageActionGate }
 
-        // Still shown: the row on screen is the *earlier* "ok", not this send's.
-        #expect(state.selectedPendingOutgoingTextMessages.map(\.state) == [.publishing])
+        let pending = try #require(state.selectedPendingOutgoingTextMessages.first)
+        var unrelated = timelineMessage(
+            id: "old",
+            direction: "outbound",
+            groupIdHex: chatId,
+            sender: account.accountIdHex,
+            plaintext: "ok",
+            recordedAt: 1_800_000_000
+        )
+        unrelated.clientToken = "some-other-send"
+        await state.applyTimelineWindow(
+            TimelinePageFfi(messages: [unrelated], hasMoreBefore: false, hasMoreAfter: false),
+            groupIdHex: chatId,
+            account: accountItem,
+            client: runtime,
+            owner: nil,
+            preparedSenderProfiles: [:],
+            projectedClientTokens: ["some-other-send"]
+        )
+        #expect(state.selectedPendingOutgoingTextMessages.map(\.clientToken) == [pending.clientToken])
 
-        // The local projection for this send lands mid-round-trip.
-        state.messageTimelineStores[chatId]?
-            .replace(with: [ownRow(id: "old", body: "ok"), ownRow(id: "new", body: "ok")])
+        var projected = timelineMessage(
+            id: "new",
+            direction: "outbound",
+            groupIdHex: chatId,
+            sender: account.accountIdHex,
+            plaintext: "ok",
+            recordedAt: 1_800_000_001
+        )
+        projected.clientToken = pending.clientToken
+        await state.applyTimelineWindow(
+            TimelinePageFfi(messages: [unrelated, projected], hasMoreBefore: false, hasMoreAfter: false),
+            groupIdHex: chatId,
+            account: accountItem,
+            client: runtime,
+            owner: nil,
+            preparedSenderProfiles: [:],
+            projectedClientTokens: ["some-other-send", pending.clientToken]
+        )
         #expect(state.selectedPendingOutgoingTextMessages.isEmpty)
 
         runtime.releaseMessageActionGate()
@@ -7578,7 +7636,7 @@ struct TimelineTests: WorkspaceTestSupport {
         #expect(state.pendingMediaAttachments.isEmpty)
         #expect(state.draftText.isEmpty)
         #expect(state.selectedPendingOutgoingMediaMessages.map(\.state) == [.uploading])
-        #expect(runtime.sendMediaAttachmentsCallCount == 0)
+        #expect(runtime.sendMediaAttachmentsCallCount == 1)
 
         // The next message does not have to wait behind it.
         state.draftText = "And this"
@@ -7591,7 +7649,7 @@ struct TimelineTests: WorkspaceTestSupport {
         await runtime.uploadReleaseGate.release("slow.txt")
         await Self.settlePendingOutgoingMediaSends(state)
 
-        #expect(runtime.uploadMediaCallCount == 1)
+        #expect(runtime.uploadMediaCallCount == 2)
         #expect(runtime.sentMediaAttachments.last?.fileNames == ["slow.txt"])
         #expect(runtime.sentMediaAttachments.last?.caption == "Look at this")
         #expect(state.selectedPendingOutgoingMediaMessages.isEmpty)
@@ -8128,7 +8186,7 @@ struct TimelineTests: WorkspaceTestSupport {
         await state.sendDraft()
         await Self.settlePendingOutgoingMediaSends(state)
 
-        #expect(runtime.uploadMediaCallCount == 1)
+        #expect(runtime.uploadMediaCallCount == 2)
         #expect(runtime.sendMediaAttachmentsCallCount == 1)
         #expect(runtime.timelineMessageQueries.last?.groupIdHex == "direct-group")
         #expect(state.messagesByChat["direct-group"]?.map(\.id) == ["media"])
@@ -9877,7 +9935,7 @@ struct TimelineTests: WorkspaceTestSupport {
             runtime.storedMessageDraft(accountRef: account.label, groupIdHex: "group")?.content == "latest"
         }
         #expect(didPersistLatest)
-        #expect(runtime.syncCallThreadRecord("saveMessageDraft") == [false])
+        #expect(runtime.syncCallThreadRecord("saveMessageDraftIfRevision") == [false])
     }
 
     @MainActor
@@ -9991,7 +10049,7 @@ struct TimelineTests: WorkspaceTestSupport {
         #expect(runtime.sentText?.text == "send once")
         #expect(state.draftText.isEmpty)
         #expect(runtime.storedMessageDraft(accountRef: account.label, groupIdHex: "group") == nil)
-        #expect(runtime.syncCallThreadRecord("deleteMessageDraft") == [false])
+        #expect(runtime.syncCallThreadRecord("clearMessageDraftIfRevision") == [false])
     }
 
     @MainActor
@@ -10726,5 +10784,81 @@ struct TimelineTests: WorkspaceTestSupport {
         #expect(state.selectedChat == nil)
         #expect(state.timelineTask == nil)
         #expect(!state.cachedMessageChatIds.contains(chatId))
+    }
+
+    @MainActor
+    @Test func forwardingUsesAUniqueDurableClientTokenForEveryMessage() async throws {
+        let account = AccountItem.samples[0]
+        let source = ChatItem.samples[0]
+        let target = ChatItem.samples[1]
+        let messages = [
+            MessageItem(
+                id: "forward-one",
+                senderName: "Alice",
+                body: "First",
+                sentAt: Date(timeIntervalSince1970: 1),
+                isOutgoing: false
+            ),
+            MessageItem(
+                id: "forward-two",
+                senderName: "Alice",
+                body: "Second",
+                sentAt: Date(timeIntervalSince1970: 2),
+                isOutgoing: false
+            ),
+        ]
+        let runtime = FakeMarmotRuntime(accounts: [])
+        let state = WorkspaceState(
+            accounts: [account],
+            chatsByAccount: [account.id: [source, target]],
+            messagesByChat: [source.id: messages],
+            clientFactory: { runtime }
+        )
+        state.client = runtime
+        state.activeAccountId = account.id
+        state.selection = .chat(source.id)
+        state.startForwarding(messages)
+
+        await state.forwardPendingMessages(to: target)
+
+        #expect(runtime.publishedTexts.map(\.text) == ["First", "Second"])
+        #expect(runtime.sentTextClientTokens.count == 2)
+        #expect(Set(runtime.sentTextClientTokens).count == 2)
+        #expect(!state.isForwardPickerPresented)
+        #expect(state.forwardingMessageIds.isEmpty)
+    }
+
+    @MainActor
+    @Test func forwardingAcceptsAnInterruptedSendAfterDurableLocalAdmission() async throws {
+        let account = AccountItem.samples[0]
+        let source = ChatItem.samples[0]
+        let target = ChatItem.samples[1]
+        let message = MessageItem(
+            id: "forward",
+            senderName: "Alice",
+            body: "Forward me",
+            sentAt: Date(timeIntervalSince1970: 1),
+            isOutgoing: false
+        )
+        let runtime = FakeMarmotRuntime(accounts: [])
+        runtime.sendTextError = FakeMarmotRuntimeError.unused
+        runtime.localSendStatusFallback = .queued
+        let state = WorkspaceState(
+            accounts: [account],
+            chatsByAccount: [account.id: [source, target]],
+            messagesByChat: [source.id: [message]],
+            clientFactory: { runtime }
+        )
+        state.client = runtime
+        state.activeAccountId = account.id
+        state.selection = .chat(source.id)
+        state.startForwarding([message])
+
+        await state.forwardPendingMessages(to: target)
+
+        #expect(runtime.sentTextClientTokens.count == 1)
+        #expect(!state.isForwardPickerPresented)
+        #expect(state.forwardingMessageIds.isEmpty)
+        #expect(state.lastError == nil)
     }
 }

@@ -21,6 +21,7 @@ extension EnvironmentValues {
 
 struct ContentView: View {
     @Environment(WorkspaceState.self) private var workspace
+    @Environment(SessionState.self) private var session
     @State private var timestampReferenceDate = Date()
 
     var body: some View {
@@ -132,9 +133,11 @@ struct ContentView: View {
             // search sheet: `\.locale` is injected at this root, and a sheet is a separate
             // presentation that does not inherit it, so both have to re-inject it themselves.
             .sheet(isPresented: $workspace.isImprovementsPromptPresented) {
-                HelpImproveWhiteNoiseSheet()
-                    .environment(workspace)
-                    .environment(\.locale, workspace.preferredLocale)
+                if let model = session.accountScope?.settingsModel.diagnostics {
+                    HelpImproveWhiteNoiseSheet(model: model)
+                        .environment(workspace)
+                        .environment(\.locale, workspace.preferredLocale)
+                }
             }
             .onReceive(
                 NotificationCenter.default.publisher(

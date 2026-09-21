@@ -16,7 +16,7 @@ import SwiftUI
 /// bar's `principal` slot; a settings page here has `SettingsHeader` instead of a navigation
 /// bar, so the switcher moves into the content, centred directly above the code it switches.
 /// Its `.palette` style is iOS-only, so it becomes the `.segmented` style this app
-/// already uses for `GroupSharedMediaSection`. And the copy is the Flutter client's, not the
+/// already uses for shared-media presentation. And the copy is the Flutter client's, not the
 /// prototype's: "As a 501(c)3 non-profit…" is the shipped product line and is already written
 /// in all ten of this catalog's languages, where the prototype's "free and open source"
 /// sentence exists only in English.

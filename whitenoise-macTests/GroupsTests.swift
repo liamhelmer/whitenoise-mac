@@ -278,13 +278,19 @@ struct GroupsTests: WorkspaceTestSupport {
         }
 
         state.showGroupImagePicker(for: groupChat)
-        runtime.installChatListUpdates([
-            .removeRow(trigger: .removed, groupIdHex: groupChat.id)
-        ])
-        await state.reloadChats()
-        let didRemoveSelectedChat = await waitFor {
-            state.activeChats.isEmpty && state.selectedChat == nil
-        }
+        let accountItem = try #require(state.activeAccount)
+        let snapshot = try await runtime.presentedChatList(
+            accountRef: accountItem.accountRef,
+            includeArchived: true
+        )
+        await state.applyPresentedChatListSnapshot(
+            PresentedChatListSnapshotFfi(
+                rows: snapshot.rows.filter { $0.row.groupIdHex != groupChat.id },
+                presentationVersion: snapshot.presentationVersion
+            ),
+            account: accountItem
+        )
+        let didRemoveSelectedChat = state.activeChats.isEmpty && state.selectedChat == nil
 
         #expect(didRemoveSelectedChat)
         #expect(!state.isGroupImagePickerPresented)
@@ -312,13 +318,20 @@ struct GroupsTests: WorkspaceTestSupport {
 
         state.selectChat(groupChat)
         state.showGroupImagePicker(for: groupChat)
-        runtime.installChatListUpdates([
-            .removeRow(trigger: .removed, groupIdHex: groupChat.id)
-        ])
-        await state.reloadChats()
-        let didReselectNextChat = await waitFor {
+        let accountItem = try #require(state.activeAccount)
+        let snapshot = try await runtime.presentedChatList(
+            accountRef: accountItem.accountRef,
+            includeArchived: true
+        )
+        await state.applyPresentedChatListSnapshot(
+            PresentedChatListSnapshotFfi(
+                rows: snapshot.rows.filter { $0.row.groupIdHex != groupChat.id },
+                presentationVersion: snapshot.presentationVersion
+            ),
+            account: accountItem
+        )
+        let didReselectNextChat =
             state.selection == .chat("direct-group") && state.selectedChat?.id == "direct-group"
-        }
 
         #expect(didReselectNextChat)
         #expect(!state.isGroupImagePickerPresented)
@@ -386,7 +399,8 @@ struct GroupsTests: WorkspaceTestSupport {
         // gated on the same flag, so it replaces the transcript in place.
         let shellSource = try SourceContract.source(of: .messengerShell)
         #expect(shellSource.contains("if workspace.isGroupDetailsPresented"))
-        #expect(shellSource.contains("GroupDetailsSheet(chat: chat)"))
+        #expect(shellSource.contains("attachmentModel: attachmentModel"))
+        #expect(shellSource.contains("safetyModel: safetyModel"))
         #expect(shellSource.contains(".move(edge: .trailing)"))
     }
 

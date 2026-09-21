@@ -19,6 +19,7 @@ import SwiftUI
 
 struct HelpImproveWhiteNoiseSheet: View {
     @Environment(WorkspaceState.self) private var workspace
+    let model: DiagnosticsSettingsViewModel
 
     var body: some View {
         VStack(spacing: 0) {
@@ -56,7 +57,7 @@ struct HelpImproveWhiteNoiseSheet: View {
     private var choices: some View {
         Form {
             Section {
-                DataSharingToggleRows()
+                DataSharingToggleRows(model: model)
             } header: {
                 Text(
                     L10n.string(
@@ -81,7 +82,7 @@ struct HelpImproveWhiteNoiseSheet: View {
 
             // A build with no telemetry or audit credentials refuses the write and reports why.
             // Without this the switch would spring back under the pointer with no explanation.
-            SettingsErrorView(error: workspace.lastError)
+            SettingsErrorView(error: model.error?.message)
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
@@ -111,6 +112,6 @@ struct HelpImproveWhiteNoiseSheet: View {
 }
 
 #Preview {
-    HelpImproveWhiteNoiseSheet()
+    HelpImproveWhiteNoiseSheet(model: .preview())
         .environment(WorkspaceState.preview())
 }

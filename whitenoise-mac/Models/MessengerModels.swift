@@ -139,12 +139,12 @@ nonisolated struct ChatItem: Identifiable, Hashable {
     private(set) var preview: String
     /// Set when the last message carries attachments, so the row can mark the preview with a
     /// media glyph. Travels with `preview` — anything that carries one forward carries both.
-    let previewAttachmentKind: ChatPreviewAttachmentKind?
+    private(set) var previewAttachmentKind: ChatPreviewAttachmentKind?
     /// The parts `preview` was composed from, set only when the line is attributed to another
     /// account. Travels with `preview` for the same reason `previewAttachmentKind` does.
     let previewAttribution: ChatPreviewAttribution?
     let updatedAt: Date?
-    let avatarSeed: String
+    private(set) var avatarSeed: String
     /// `private(set)` so the only in-place writer is `replacingPeerPresentation` below, which
     /// re-derives `sanitizedPictureURL` alongside it. The two must never disagree.
     private(set) var pictureURL: String?
@@ -162,6 +162,9 @@ nonisolated struct ChatItem: Identifiable, Hashable {
     /// Unread messages in this chat that @-mention the active account.
     let unreadMentionCount: Int
     let isDirect: Bool
+    /// The live account block list, overlaid by the host on MarmotKit's prepared row.
+    /// Message text from a blocked direct peer must never remain visible in the inbox preview.
+    private(set) var isBlockedDirectPeer: Bool
     /// True when MDK supplied `.direct`/`.group`; false permits legacy roster enrichment.
     let hasAuthoritativeConversationKind: Bool
     let muted: Bool
@@ -193,6 +196,9 @@ nonisolated struct ChatItem: Identifiable, Hashable {
     func previewNotice(locale: Locale = AppLanguage.currentLocale) -> String? {
         if selfMembership.reportsInChatRowPreviewLine {
             return selfMembership.endedDescription(locale: locale)
+        }
+        if isBlockedDirectPeer {
+            return L10n.string("You blocked this user", locale: locale)
         }
         return previewPlaceholder(locale: locale)
     }
@@ -364,6 +370,7 @@ nonisolated struct ChatItem: Identifiable, Hashable {
         manuallyMarkedUnread: Bool = false,
         unreadMentionCount: Int = 0,
         isDirect: Bool = false,
+        isBlockedDirectPeer: Bool = false,
         hasAuthoritativeConversationKind: Bool = false,
         muted: Bool = false,
         mutedUntilMs: Int64? = nil,
@@ -391,6 +398,7 @@ nonisolated struct ChatItem: Identifiable, Hashable {
         self.manuallyMarkedUnread = manuallyMarkedUnread
         self.unreadMentionCount = unreadMentionCount
         self.isDirect = isDirect
+        self.isBlockedDirectPeer = isBlockedDirectPeer
         self.hasAuthoritativeConversationKind = hasAuthoritativeConversationKind
         self.muted = muted
         self.mutedUntilMs = mutedUntilMs
@@ -411,6 +419,96 @@ nonisolated enum ChatMessageDeliveryState: Hashable, Sendable {
     case pending
     case delivered
     case failed
+}
+
+extension ChatItem {
+    /// Builds the row from MarmotKit's selected presentation without any group/profile fan-out.
+    /// Device-local nicknames are the only presentation overlay applied by the host.
+    init(
+        presented: PresentedChatRowFfi,
+        activeAccountIdHex: String,
+        nickname: String? = nil,
+        lastSenderNickname: String? = nil,
+        avatarBytes: AvatarBytesFfi? = nil,
+        isBlockedDirectPeer: Bool = false
+    ) {
+        let selectedTitle: String
+        switch presented.presentation.title {
+        case .literal(let text):
+            selectedTitle = PeerDisplayText.sanitize(text) ?? DisplayText.short(presented.row.groupIdHex)
+        case .unnamedGroup:
+            selectedTitle = L10n.string("Unnamed group")
+        case .unavailableConversation:
+            selectedTitle =
+                PeerDisplayText.sanitize(presented.row.title)
+                ?? DisplayText.short(presented.row.groupIdHex)
+        }
+
+        let pictureURL: String?
+        let avatarSeed: String
+        switch presented.presentation.avatar {
+        case .remoteImage(let url, let cacheKey):
+            pictureURL = url
+            avatarSeed = cacheKey
+        case .encryptedGroupImage(_, let cacheKey):
+            pictureURL = nil
+            avatarSeed = cacheKey
+        case .placeholder(let stableSeed, _):
+            pictureURL = nil
+            avatarSeed = stableSeed
+        }
+
+        let peer = presented.presentation.peerId.map {
+            ChatPeerProfile(
+                accountIdHex: $0,
+                displayName: nickname ?? selectedTitle,
+                publishedDisplayName: nickname == nil ? nil : selectedTitle,
+                pictureURL: pictureURL
+            )
+        }
+        self.init(
+            row: presented.row,
+            activeAccountIdHex: activeAccountIdHex,
+            directPeer: peer,
+            groupAvatarURL: peer == nil ? pictureURL : nil,
+            groupImagePayload: avatarBytes.flatMap { payload in
+                guard payload.availability == .ready, !payload.deferred, !payload.bytes.isEmpty else {
+                    return nil
+                }
+                return DownloadedMediaPayload(id: payload.reference, data: payload.bytes)
+            },
+            lastSenderNickname: lastSenderNickname
+        )
+
+        title = nickname ?? selectedTitle
+        publishedTitle = nickname == nil ? nil : selectedTitle
+        self.avatarSeed = avatarSeed
+        self.pictureURL = pictureURL
+        sanitizedPictureURL = RemoteImageURLPolicy.sanitizedURL(from: pictureURL)
+
+        switch presented.preview {
+        case .draft(let draft):
+            let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty, draft.attachmentCount > 0 {
+                preview =
+                    draft.attachmentCount == 1
+                    ? L10n.string("Attachment")
+                    : L10n.plural("%lld attachments", Int64(draft.attachmentCount))
+            } else {
+                preview = text
+            }
+            previewAttachmentKind =
+                draft.attachmentCount > 0
+                ? ChatPreviewAttachmentKind(draft.attachmentKind)
+                : nil
+        case .message:
+            break
+        case .invitation, .empty:
+            preview = ""
+            previewAttachmentKind = nil
+        }
+        self.isBlockedDirectPeer = isBlockedDirectPeer
+    }
 }
 
 /// Who a chat row's last-message line is attributed to, kept alongside the composed `preview` so
@@ -491,17 +589,20 @@ nonisolated struct ChatPeerProfile: Hashable, Sendable {
     let displayName: String?
     let publishedDisplayName: String?
     let pictureURL: String?
+    let imagePayload: DownloadedMediaPayload?
 
     init(
         accountIdHex: String,
         displayName: String?,
         publishedDisplayName: String? = nil,
-        pictureURL: String?
+        pictureURL: String?,
+        imagePayload: DownloadedMediaPayload? = nil
     ) {
         self.accountIdHex = accountIdHex
         self.displayName = displayName
         self.publishedDisplayName = publishedDisplayName
         self.pictureURL = pictureURL
+        self.imagePayload = imagePayload
     }
 }
 
@@ -716,6 +817,46 @@ nonisolated enum MessageMediaKind: Hashable, Sendable {
 nonisolated struct MessageMediaAttachment: Identifiable, Hashable {
     let id: String
     let reference: MediaAttachmentReferenceFfi
+    let rejectionKind: MediaAttachmentRejectionKindFfi?
+
+    init(
+        id: String,
+        reference: MediaAttachmentReferenceFfi,
+        rejectionKind: MediaAttachmentRejectionKindFfi? = nil
+    ) {
+        self.id = id
+        self.reference = reference
+        self.rejectionKind = rejectionKind
+    }
+
+    static func rejected(
+        id: String,
+        kind: MediaAttachmentRejectionKindFfi
+    ) -> MessageMediaAttachment {
+        MessageMediaAttachment(
+            id: id,
+            reference: MediaAttachmentReferenceFfi(
+                locators: [],
+                ciphertextSha256: "",
+                plaintextSha256: "",
+                nonceHex: "",
+                fileName: L10n.string("Attachment"),
+                mediaType: "application/octet-stream",
+                version: .v2,
+                sourceEpoch: 0,
+                dim: nil,
+                thumbhash: nil
+            ),
+            rejectionKind: kind
+        )
+    }
+
+    var rejectionMessage: String? {
+        guard let rejectionKind else { return nil }
+        return rejectionKind == .unsupportedFormat
+            ? L10n.string("Unsupported attachment")
+            : L10n.string("Attachment couldn’t be read")
+    }
 
     var fileName: String {
         reference.fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -734,6 +875,9 @@ nonisolated struct MessageMediaAttachment: Identifiable, Hashable {
     }
 
     var previewLabel: String {
+        if let rejectionMessage {
+            return rejectionMessage
+        }
         switch kind {
         case .image:
             return L10n.string("Photo")
@@ -976,31 +1120,45 @@ nonisolated enum PendingOutgoingMediaMessageState: Hashable, Sendable {
 /// finish. This is the row the transcript shows in the gap between "sent" and "published".
 nonisolated struct PendingOutgoingMediaMessage: Identifiable, Hashable, Sendable {
     let id: UUID
+    /// Stable idempotency and reconciliation identity for the draft submission.
+    let clientToken: String
     let attachments: [PendingMediaAttachment]
     let caption: String
     let createdAt: Date
     var state: PendingOutgoingMediaMessageState
-    /// The plaintext digests of this message's blobs, stamped once every upload has handed back a
-    /// reference and empty until then.
-    ///
-    /// The published row carries the same digests, which is what lets the transcript retire this
-    /// bubble the moment the row it became is on screen. It has to: the core commits an own send
-    /// locally *inside* the publish call, so the real row can arrive through the timeline
-    /// subscription while the relay round-trip is still in flight — and until then both rendered.
-    var publishedPlaintextSHAs: Set<String> = []
 
     init(
         id: UUID = UUID(),
+        clientToken: String? = nil,
         attachments: [PendingMediaAttachment],
         caption: String,
         createdAt: Date = Date(),
         state: PendingOutgoingMediaMessageState = .uploading
     ) {
         self.id = id
+        self.clientToken = clientToken ?? id.uuidString.lowercased()
         self.attachments = attachments
         self.caption = caption
         self.createdAt = createdAt
         self.state = state
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id
+            && lhs.clientToken == rhs.clientToken
+            && lhs.attachments == rhs.attachments
+            && lhs.caption == rhs.caption
+            && lhs.createdAt == rhs.createdAt
+            && lhs.state == rhs.state
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(clientToken)
+        hasher.combine(attachments)
+        hasher.combine(caption)
+        hasher.combine(createdAt)
+        hasher.combine(state)
     }
 
     /// Attachments that render as grid tiles, matching `MessageItem.visualMediaAttachments` so a
@@ -1058,34 +1216,27 @@ nonisolated enum PendingOutgoingTextMessageState: Hashable, Sendable {
 /// message — before the send reaches it, and after a failed publish rolls its projection back.
 nonisolated struct PendingOutgoingTextMessage: Identifiable, Hashable, Sendable {
     let id: UUID
+    /// Stable idempotency and reconciliation identity owned by the durable-send contract.
+    /// Retries reuse this exact value; only a projected row carrying it retires the placeholder.
+    let clientToken: String
     /// Exactly the bytes handed to the core: mentions already canonicalized, ends already trimmed.
-    /// Also how the published row is recognized, the way a media message uses its plaintext
-    /// digests — text is its own digest.
     let text: String
     /// Carried so a retry re-sends the message as the reply it was, rather than as a loose message
     /// under the one it was answering.
     let replyContext: MessageReplyContext?
     let createdAt: Date
     var state: PendingOutgoingTextMessageState
-    /// How many own rows in this transcript already carried `text` when the publish began, or nil
-    /// until it has begun.
-    ///
-    /// The retirement key, and the reason it is a count rather than a flag: the core commits an own
-    /// send locally inside the publish call, so the real row can arrive while the round-trip is
-    /// still going and both would render at once. Comparing against the count taken *before* the
-    /// publish is what distinguishes "the row for this message has arrived" from "this conversation
-    /// already contained an identical message" — a flag would hide the second `ok` of a
-    /// conversation behind the first one.
-    var ownBodyCountBeforePublish: Int?
 
     init(
         id: UUID = UUID(),
+        clientToken: String? = nil,
         text: String,
         replyContext: MessageReplyContext? = nil,
         createdAt: Date = Date(),
         state: PendingOutgoingTextMessageState = .queued
     ) {
         self.id = id
+        self.clientToken = clientToken ?? id.uuidString.lowercased()
         self.text = text
         self.replyContext = replyContext
         self.createdAt = createdAt
@@ -2245,6 +2396,15 @@ nonisolated enum MessagePresentation: Hashable {
     }
 }
 
+/// Durable provenance for a projected deletion tombstone. Keeping this app-owned avoids
+/// leaking generated FFI types into SwiftUI while still distinguishing moderation from an
+/// author's own deletion.
+nonisolated enum MessageDeletionSource: Hashable, Sendable {
+    case unknown
+    case author
+    case admin
+}
+
 nonisolated struct MessageItem: Identifiable, Hashable {
     let id: String
     let groupIdHex: String
@@ -2263,6 +2423,7 @@ nonisolated struct MessageItem: Identifiable, Hashable {
     /// the row so clearing a nickname restores the real name without consulting a profile cache.
     var publishedSenderName: String?
     let senderPictureURL: String?
+    let senderImagePayload: DownloadedMediaPayload?
     let body: String
     /// Canonical plaintext used when editing or forwarding. For edited messages, `body` is the
     /// roster-resolved display text while this retains stable npub mention tokens.
@@ -2281,8 +2442,11 @@ nonisolated struct MessageItem: Identifiable, Hashable {
     let timelineAt: UInt64
     let timelineKind: UInt64
     let isDeleted: Bool
+    let deletionSource: MessageDeletionSource
+    let hasReports: Bool
     let invalidationStatus: String?
     let isEdited: Bool
+    let editCount: UInt64
     let isOutgoing: Bool
     let reactions: [MessageReaction]
     var replyContext: MessageReplyContext?
@@ -2294,6 +2458,17 @@ nonisolated struct MessageItem: Identifiable, Hashable {
     let timeLabel: String
     let statusLabel: String?
     let metadataLabel: String
+
+    var hasFiniteRetentionExpiry: Bool {
+        (retentionSeconds ?? 0) > 0 && (retentionExpiresAt ?? 0) > 0
+    }
+
+    nonisolated func retentionExpirationLabel(locale: Locale = AppLanguage.currentLocale) -> String? {
+        guard hasFiniteRetentionExpiry, let retentionExpiresAt else { return nil }
+        let style = Date.FormatStyle(date: .abbreviated, time: .standard).locale(locale)
+        let expiration = Date(timeIntervalSince1970: TimeInterval(retentionExpiresAt)).formatted(style)
+        return String(format: L10n.string("Disappearing messages: %@", locale: locale), expiration)
+    }
 
     /// Whether the bubble should render the parsed Markdown AST instead of plain text.
     var rendersMarkdown: Bool { contentMarkdown != nil }
@@ -2404,6 +2579,12 @@ nonisolated struct MessageItem: Identifiable, Hashable {
         if isEdited {
             parts.append(L10n.string("Edited"))
         }
+        if hasReports {
+            parts.append(L10n.string("Report submitted"))
+        }
+        if let retention = retentionExpirationLabel(locale: locale) {
+            parts.append(retention)
+        }
         if let statusLabel = statusLabel(for: indicator) {
             parts.append(statusLabel)
         }
@@ -2425,6 +2606,7 @@ nonisolated struct MessageItem: Identifiable, Hashable {
         senderName: String,
         publishedSenderName: String? = nil,
         senderPictureURL: String? = nil,
+        senderImagePayload: DownloadedMediaPayload? = nil,
         body: String,
         wireBody: String? = nil,
         contentMarkdown: MarkdownDocumentFfi? = nil,
@@ -2433,8 +2615,11 @@ nonisolated struct MessageItem: Identifiable, Hashable {
         timelineAt: UInt64? = nil,
         timelineKind: UInt64 = 9,
         isDeleted: Bool = false,
+        deletionSource: MessageDeletionSource = .unknown,
+        hasReports: Bool = false,
         invalidationStatus: String? = nil,
         isEdited: Bool = false,
+        editCount: UInt64 = 0,
         isOutgoing: Bool,
         reactions: [MessageReaction] = [],
         replyContext: MessageReplyContext? = nil,
@@ -2455,6 +2640,7 @@ nonisolated struct MessageItem: Identifiable, Hashable {
         self.senderName = senderName
         self.publishedSenderName = publishedSenderName
         self.senderPictureURL = senderPictureURL
+        self.senderImagePayload = senderImagePayload
         self.body = body
         self.wireBody = wireBody ?? body
         // Built here — once, off-main — rather than during a body pass, so a layout pass never
@@ -2488,8 +2674,11 @@ nonisolated struct MessageItem: Identifiable, Hashable {
         self.timelineAt = resolvedTimelineAt
         self.timelineKind = timelineKind
         self.isDeleted = isDeleted
+        self.deletionSource = deletionSource
+        self.hasReports = hasReports
         self.invalidationStatus = invalidationStatus
         self.isEdited = isEdited
+        self.editCount = editCount
         self.isOutgoing = isOutgoing
         self.reactions = reactions
         self.replyContext = replyContext
@@ -2516,6 +2705,9 @@ nonisolated struct MessageItem: Identifiable, Hashable {
         var metadataParts = [timeLabel]
         if isEdited {
             metadataParts.append(L10n.string("Edited"))
+        }
+        if hasReports {
+            metadataParts.append(L10n.string("Report submitted"))
         }
         if let statusLabel {
             metadataParts.append(statusLabel)
@@ -2544,6 +2736,7 @@ nonisolated struct MessageItem: Identifiable, Hashable {
             senderName: senderName,
             publishedSenderName: publishedSenderName,
             senderPictureURL: senderPictureURL,
+            senderImagePayload: senderImagePayload,
             body: body,
             wireBody: wireBody,
             contentMarkdown: nil,
@@ -2552,6 +2745,7 @@ nonisolated struct MessageItem: Identifiable, Hashable {
             timelineAt: timelineAt,
             timelineKind: timelineKind,
             isDeleted: isDeleted,
+            hasReports: hasReports,
             invalidationStatus: invalidationStatus,
             isEdited: true,
             isOutgoing: isOutgoing,
@@ -2629,6 +2823,10 @@ nonisolated struct MessageItem: Identifiable, Hashable {
 
     var supportsChatActions: Bool {
         isActionableChatBubble
+    }
+
+    var canReport: Bool {
+        isActionableChatBubble && !isOutgoing && !hasReports
     }
 
     /// The core commits outgoing messages locally before publishing them. A missing source
@@ -2814,6 +3012,7 @@ extension MessageItem {
             && lhs.senderAccountIdHex == rhs.senderAccountIdHex
             && lhs.senderName == rhs.senderName
             && lhs.senderPictureURL == rhs.senderPictureURL
+            && lhs.senderImagePayload == rhs.senderImagePayload
             && lhs.body == rhs.body
             && lhs.wireBody == rhs.wireBody
             && lhs.mentionNames == rhs.mentionNames
@@ -2858,10 +3057,14 @@ enum SettingsPage: Equatable {
     case keyPackages
     case appearance
     case privacySecurity
+    case blockedUsers
     case notifications
     case storage
+    case agents
+    case support
     case donate
     case developerMode
+    case quarantinedGroups
 
     /// The drawer's cards, ported from `wn-ios-prototype`'s hub: a group of destinations per
     /// question the reader is asking. One flat column of ten rows gave no signal that Relays and
@@ -2892,9 +3095,11 @@ enum SettingsPage: Equatable {
             .privacySecurity,
             .storage,
             .relays,
+            .agents,
         ],
         [
             .preferences,
+            .support,
             .donate,
             .developerMode,
         ],
@@ -2915,8 +3120,10 @@ enum SettingsPage: Equatable {
     /// settings had been left behind.
     var drawerPage: SettingsPage {
         switch self {
-        case .keyPackages:
+        case .keyPackages, .quarantinedGroups:
             .developerMode
+        case .blockedUsers:
+            .privacySecurity
         default:
             self
         }
@@ -2948,14 +3155,22 @@ enum SettingsPage: Equatable {
             "Appearance"
         case .privacySecurity:
             "Privacy & Security"
+        case .blockedUsers:
+            "Blocked Users"
         case .notifications:
             "Notifications"
         case .storage:
             "Storage"
+        case .agents:
+            "AI Agents"
+        case .support:
+            "Support"
         case .donate:
             "Donate"
         case .developerMode:
             "Developer mode"
+        case .quarantinedGroups:
+            "Quarantined Groups"
         }
     }
 
@@ -2977,16 +3192,24 @@ enum SettingsPage: Equatable {
             "circle.lefthalf.filled"
         case .privacySecurity:
             "hand.raised"
+        case .blockedUsers:
+            "person.crop.circle.badge.xmark"
         case .notifications:
             "bell"
         case .storage:
             "externaldrive"
+        case .agents:
+            "sparkles"
+        case .support:
+            "questionmark.bubble"
         case .donate:
             // Outline, not `heart.fill`: the prototype's Donate destination uses the outline
             // symbol, and every other glyph in this drawer is an outline too.
             "heart"
         case .developerMode:
             "wrench.and.screwdriver"
+        case .quarantinedGroups:
+            "exclamationmark.shield"
         }
     }
 }
@@ -3093,25 +3316,6 @@ enum NotificationPreviewMode: String, CaseIterable, Identifiable {
     }
 }
 
-struct PrivacySecuritySettingsSnapshot: Equatable {
-    var relayTelemetryEnabled: Bool
-    var relayTelemetryIntervalSeconds: UInt64
-    /// Audit logging is a single on/off choice. The core records the obfuscated,
-    /// privacy-safe set unconditionally — marmotkit v0.9.16 removed the selectable
-    /// data mode, so there is no full-data posture to opt into.
-    var auditLoggingEnabled: Bool
-    var telemetryCredentialsAvailable: Bool
-    var auditLogCredentialsAvailable: Bool
-
-    static let defaults = PrivacySecuritySettingsSnapshot(
-        relayTelemetryEnabled: false,
-        relayTelemetryIntervalSeconds: 60,
-        auditLoggingEnabled: false,
-        telemetryCredentialsAvailable: false,
-        auditLogCredentialsAvailable: false
-    )
-}
-
 struct DiagnosticsInfoItem: Identifiable, Equatable {
     let title: String
     let value: String
@@ -3216,45 +3420,6 @@ struct RelaySettingsSnapshot: Equatable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .filter { seen.insert($0).inserted }
-    }
-}
-
-struct KeyPackageItem: Identifiable, Equatable {
-    let accountRef: String?
-    let accountIdHex: String
-    let keyPackageId: String
-    let keyPackageRefHex: String
-    let eventIdHex: String
-    let publishedAt: Date?
-    let keyPackageBytes: UInt64
-    let sourceRelays: [String]
-    let isLocal: Bool
-    let isRelayDiscovered: Bool
-
-    var id: String {
-        if !eventIdHex.isEmpty { return eventIdHex }
-        if !keyPackageRefHex.isEmpty { return keyPackageRefHex }
-        return keyPackageId
-    }
-
-    var sourceLabel: String {
-        statusLabels.joined(separator: " + ")
-    }
-
-    var statusLabels: [String] {
-        var labels: [String] = []
-        if isLocal {
-            labels.append(L10n.string("Local"))
-        }
-        if isRelayDiscovered {
-            labels.append(L10n.string("Synced"))
-        }
-        return labels.isEmpty ? [L10n.string("Unknown")] : labels
-    }
-
-    var publishedLabel: String {
-        guard let publishedAt else { return L10n.string("Unknown") }
-        return DisplayText.dateTimeTimestamp(for: publishedAt)
     }
 }
 
@@ -3384,6 +3549,7 @@ enum ChatListFilter: String, CaseIterable {
     case active
     case unread
     case archived
+    case left
 
     var title: String {
         switch self {
@@ -3393,6 +3559,8 @@ enum ChatListFilter: String, CaseIterable {
             return L10n.string("Unread")
         case .archived:
             return L10n.string("Archived")
+        case .left:
+            return L10n.string("Left")
         }
     }
 
@@ -3404,6 +3572,8 @@ enum ChatListFilter: String, CaseIterable {
             return "circle.fill"
         case .archived:
             return "archivebox"
+        case .left:
+            return "rectangle.portrait.and.arrow.right"
         }
     }
 }

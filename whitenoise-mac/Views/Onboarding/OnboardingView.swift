@@ -20,18 +20,28 @@ import SwiftUI
 /// the only thing any pane is allowed to change about the scaffold. See `OnboardingScaffold`.
 struct OnboardingView: View {
     @Environment(WorkspaceState.self) private var workspace
+    let model: OnboardingCoordinator?
 
     var body: some View {
         Group {
-            switch workspace.authenticationMode {
-            case .landing:
-                OnboardingWelcomeView()
-            case .login:
-                OnboardingSignInView()
-            case .signUp:
-                OnboardingSignUpView()
+            if let model, model.snapshot != nil {
+                AccountSetupView(model: model)
+            } else {
+                switch workspace.authenticationMode {
+                case .landing:
+                    OnboardingWelcomeView()
+                case .login:
+                    OnboardingSignInView()
+                case .signUp:
+                    OnboardingSignUpView()
+                }
             }
         }
         .animation(.smooth(duration: 0.2), value: workspace.authenticationMode)
     }
+}
+
+#Preview {
+    OnboardingView(model: nil)
+        .environment(WorkspaceState.preview())
 }

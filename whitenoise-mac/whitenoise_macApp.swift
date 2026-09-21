@@ -5,16 +5,20 @@
 //  Created by Jeff Gardner on 26/05/2026.
 //
 
+import MarmotKit
 import SwiftUI
 
 @main
 struct whitenoise_macApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var workspace: WorkspaceState
+    @State private var session: SessionState
     private let shouldBootstrapWorkspace: Bool
 
     init() {
         let configuration = AppLaunchConfiguration.current
         _workspace = State(initialValue: configuration.makeWorkspace())
+        _session = State(initialValue: SessionState())
         shouldBootstrapWorkspace = configuration.shouldBootstrapWorkspace
     }
 
@@ -29,6 +33,7 @@ struct whitenoise_macApp: App {
         Window("White Noise", id: "main") {
             ContentView()
                 .environment(workspace)
+                .environment(session)
                 .task {
                     if shouldBootstrapWorkspace {
                         // Started before the bootstrap it runs alongside, not after: a cold start
@@ -38,7 +43,32 @@ struct whitenoise_macApp: App {
                         // in the literal sense — it opens no sockets at all.
                         workspace.startConnectivityMonitoring()
                         await workspace.bootstrap()
+                        await synchronizeAccountScope()
                     }
+                }
+                .task(id: workspace.activeAccountId) {
+                    await synchronizeAccountScope()
+                }
+                .task(id: workspace.selectedChat?.id) {
+                    await synchronizeConversationProjection()
+                }
+                .task(id: workspace.isOffline) {
+                    session.updateConnectivity(available: !workspace.isOffline)
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    let activity: ProductAnalyticsActivityFfi?
+                    switch phase {
+                    case .active:
+                        activity = .foreground
+                    case .background:
+                        activity = .background
+                    case .inactive:
+                        activity = nil
+                    @unknown default:
+                        activity = nil
+                    }
+                    guard let activity else { return }
+                    Task { await session.updateProductAnalyticsActivity(activity) }
                 }
         }
         .windowStyle(.hiddenTitleBar)
@@ -51,6 +81,95 @@ struct whitenoise_macApp: App {
                 .keyboardShortcut("f", modifiers: [.command, .shift])
                 .disabled(workspace.activeAccount == nil)
             }
+        }
+    }
+
+    @MainActor
+    private func synchronizeAccountScope() async {
+        let activatingAccountID = workspace.activeAccountId
+        await session.activate(
+            account: workspace.activeAccount,
+            runtime: workspace.client,
+            connectivityAvailable: !workspace.isOffline,
+            relayListsDidChange: { [weak workspace] in
+                guard let workspace, let accountID = activatingAccountID else { return }
+                workspace.peerProfileLookupRelaysByAccountId[accountID] = nil
+            }
+        )
+        guard let scope = session.accountScope else { return }
+        if scenePhase == .active {
+            await session.updateProductAnalyticsActivity(.foreground)
+        }
+
+        // The workspace still owns the legacy selection/composer state during the staged
+        // migration, but it must not keep a second chat-list subscription alive. Hand that
+        // compatibility state complete prepared snapshots from the account-scoped model.
+        workspace.stopChatListListener()
+        let account = scope.account
+        let chatListModel = scope.chatListModel
+        await chatListModel.setSnapshotObserver { [weak workspace, weak chatListModel] snapshot in
+            guard let workspace, let chatListModel else { return }
+            await workspace.applyPresentedChatListSnapshot(
+                snapshot,
+                account: account,
+                avatarBytesByReference: chatListModel.avatarBytesByReference
+            )
+        }
+        await synchronizeConversationProjection()
+    }
+
+    @MainActor
+    private func synchronizeConversationProjection() async {
+        guard let scope = session.accountScope,
+            let chat = workspace.selectedChat,
+            workspace.activeAccountId == scope.account.id
+        else {
+            session.accountScope?.releaseSelectedConversation()
+            return
+        }
+
+        let model = scope.selectConversation(groupIdHex: chat.id)
+        workspace.cancelTimelineLoad()
+        workspace.stopTimelineListener()
+        let account = scope.account
+        let runtime = scope.runtime
+        let avatarAssets = scope.avatarAssets
+        let blockedUsers = scope.blockedUsers
+        let installSnapshot: @MainActor (ConversationWindowSnapshotFfi) async -> Void = {
+            [weak workspace, weak model, weak avatarAssets, weak blockedUsers] snapshot in
+            guard let workspace, let model,
+                workspace.activeAccountId == account.id,
+                workspace.selectedChat?.id == model.groupIdHex
+            else { return }
+            let identityAssets = snapshot.identities.compactMap(\.avatarAsset)
+            await avatarAssets?.load(assets: identityAssets)
+            let timelineRecords = BlockedConversationPresentation.timelineRecords(
+                snapshot: snapshot,
+                blockedAccountIDs: blockedUsers?.blockedAccountIDs ?? []
+            )
+            let page = TimelinePageFfi(
+                messages: timelineRecords,
+                hasMoreBefore: snapshot.hasMoreBefore,
+                hasMoreAfter: snapshot.hasMoreAfter
+            )
+            await workspace.applyTimelineWindow(
+                page,
+                groupIdHex: model.groupIdHex,
+                account: account,
+                client: runtime,
+                owner: nil,
+                preparedSenderProfiles: snapshot.senderProfiles(
+                    activeAccount: account,
+                    nicknames: workspace.activeContactNicknames,
+                    avatarBytesByReference: avatarAssets?.bytesByReference ?? [:]
+                ),
+                projectedClientTokens: Set(timelineRecords.compactMap(\.clientToken))
+            )
+        }
+        await model.setSnapshotObserver(installSnapshot)
+        await blockedUsers.setChangeObserver { [weak model] _ in
+            guard let snapshot = model?.snapshot else { return }
+            await installSnapshot(snapshot)
         }
     }
 }

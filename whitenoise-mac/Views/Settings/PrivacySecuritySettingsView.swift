@@ -25,11 +25,16 @@ import SwiftUI
 
 struct PrivacySecuritySettingsView: View {
     @Environment(WorkspaceState.self) private var workspace
+    let model: DiagnosticsSettingsViewModel
     @State private var showClearLogsConfirmation = false
     @State private var showEraseAppDataConfirmation = false
 
     var body: some View {
         SettingsScaffold(title: L10n.string("Privacy & Security")) {
+            SettingsSection {
+                SettingsNavigationRow(page: .blockedUsers)
+            }
+
             SettingsSection(
                 title: L10n.string("Remote Content"),
                 footer: L10n.string(
@@ -46,9 +51,12 @@ struct PrivacySecuritySettingsView: View {
                 )
             }
 
-            DiagnosticsAndImprovementsSections()
+            DiagnosticsAndImprovementsSections(model: model)
 
-            StoredDiagnosticLogsSection(showClearConfirmation: $showClearLogsConfirmation)
+            StoredDiagnosticLogsSection(
+                model: model,
+                showClearConfirmation: $showClearLogsConfirmation
+            )
 
             SettingsSection(
                 title: L10n.string("Device Data"),
@@ -74,7 +82,7 @@ struct PrivacySecuritySettingsView: View {
             }
         }
         .task {
-            await workspace.loadAuditLogFiles()
+            await model.load()
         }
         .confirmationDialog(
             L10n.string("Clear diagnostic logs?"),
@@ -82,7 +90,7 @@ struct PrivacySecuritySettingsView: View {
             titleVisibility: .visible
         ) {
             Button(L10n.string("Clear Logs"), role: .destructive) {
-                Task { await workspace.deleteAllAuditLogFiles() }
+                Task { await model.deleteAllAuditLogs() }
             }
             Button(L10n.string("Cancel"), role: .cancel) {}
         } message: {
@@ -116,7 +124,7 @@ struct PrivacySecuritySettingsView: View {
 /// That is also why the footers are separate — a shared one would have to describe both at once,
 /// which is how this pair ended up with no explanation at all.
 private struct DiagnosticsAndImprovementsSections: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: DiagnosticsSettingsViewModel
 
     var body: some View {
         SettingsSection(
@@ -125,25 +133,39 @@ private struct DiagnosticsAndImprovementsSections: View {
                 "Shares anonymous reliability, performance, and feature-use data to help improve White Noise. Messages, media, contacts, profile details, and keys are never included."
             )
         ) {
-            AnonymousTelemetryToggleRow()
+            DataSharingToggleRows(model: model)
+
+            if let status = model.status {
+                SettingsValueRow(
+                    title: L10n.string("Status"),
+                    value: exporterSummary(status)
+                )
+            }
         }
 
-        SettingsSection(
-            footer: L10n.string(
-                "Sends sanitized technical activity to White Noise to help troubleshoot problems. Message content is excluded and identifiers are obscured."
-            )
-        ) {
-            AuditLoggingToggleRow()
-
-            if workspace.isSavingPrivacySecurity {
-                HStack(spacing: 10) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(L10n.string("Saving..."))
-                        .wnFont(.medium12)
-                        .foregroundStyle(WNColor.backgroundContentSecondary)
-                }
+        if let error = model.error {
+            SettingsSection {
+                SettingsErrorView(error: error.message)
             }
+        }
+    }
+
+    private func exporterSummary(_ status: UsageDiagnosticsStatusFfi) -> String {
+        String(
+            format: L10n.string("Usage: %@. Diagnostics: %@."),
+            exporterLabel(status.productAnalytics),
+            exporterLabel(status.telemetry)
+        )
+    }
+
+    private func exporterLabel(_ status: DiagnosticsExporterStatusFfi) -> String {
+        switch status {
+        case .disabled: L10n.string("Off")
+        case .consentRequired: L10n.string("Permission needed")
+        case .unconfigured: L10n.string("Not configured")
+        case .unsupportedBuild: L10n.string("Unavailable in this build")
+        case .ready: L10n.string("Ready to share")
+        case .configurationRejected: L10n.string("Configuration rejected")
         }
     }
 }
@@ -157,11 +179,11 @@ private struct DiagnosticsAndImprovementsSections: View {
 /// Absent entirely when nothing is stored. The empty-state card this replaces was a row about
 /// nothing — the switch above it already says why there are no logs.
 private struct StoredDiagnosticLogsSection: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: DiagnosticsSettingsViewModel
     @Binding var showClearConfirmation: Bool
 
     var body: some View {
-        if !workspace.auditLogFiles.isEmpty {
+        if !model.auditLogFiles.isEmpty {
             SettingsSection(
                 title: L10n.string("Stored Diagnostic Logs"),
                 footer: L10n.string("Turning logging off keeps existing logs until you clear them.")
@@ -174,36 +196,33 @@ private struct StoredDiagnosticLogsSection: View {
 
                 HStack(spacing: 10) {
                     Button {
-                        Task { await workspace.uploadAuditLogFiles() }
+                        Task { await model.uploadAuditLogs() }
                     } label: {
                         SettingsBusyLabel(
-                            title: workspace.isUploadingAuditLogFiles
+                            title: model.isUploadingAuditLogs
                                 ? L10n.string("Uploading...") : L10n.string("Upload Now"),
                             systemImage: "arrow.up.doc",
-                            isBusy: workspace.isUploadingAuditLogFiles
+                            isBusy: model.isUploadingAuditLogs
                         )
                     }
                     .buttonStyle(.wnSecondary)
-                    .disabled(
-                        workspace.isUploadingAuditLogFiles
-                            || !workspace.privacySecuritySettings.auditLogCredentialsAvailable
-                    )
+                    .disabled(model.isUploadingAuditLogs)
 
                     Button {
                         showClearConfirmation = true
                     } label: {
                         SettingsBusyLabel(
-                            title: workspace.isDeletingAuditLogFiles
+                            title: model.isDeletingAuditLogs
                                 ? L10n.string("Clearing...") : L10n.string("Clear Logs"),
                             systemImage: "trash",
-                            isBusy: workspace.isDeletingAuditLogFiles
+                            isBusy: model.isDeletingAuditLogs
                         )
                     }
                     .buttonStyle(.wnSecondary)
-                    .disabled(workspace.isDeletingAuditLogFiles)
+                    .disabled(model.isDeletingAuditLogs)
                 }
 
-                if let auditLogUploadStatus = workspace.auditLogUploadStatus {
+                if let auditLogUploadStatus = model.auditUploadStatus {
                     SettingsStatusNote(
                         text: auditLogUploadStatus,
                         intention: .success,
@@ -215,7 +234,7 @@ private struct StoredDiagnosticLogsSection: View {
     }
 
     private var storedByteCount: UInt64 {
-        workspace.auditLogFiles.reduce(into: UInt64(0)) { total, file in
+        model.auditLogFiles.reduce(into: UInt64(0)) { total, file in
             total += file.sizeBytes
         }
     }

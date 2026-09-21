@@ -11,10 +11,15 @@ import SwiftUI
 
 struct SettingsPanelView: View {
     @Environment(WorkspaceState.self) private var workspace
+    let model: SettingsViewModel
 
     private var page: SettingsPage {
         if case .settings(let page) = workspace.selection { return page }
         return .overview
+    }
+
+    private var loadKey: SettingsPanelLoadKey {
+        SettingsPanelLoadKey(accountID: workspace.activeAccountId, page: page)
     }
 
     var body: some View {
@@ -29,21 +34,29 @@ struct SettingsPanelView: View {
             case .identityKeys:
                 ProfileKeysSettingsView()
             case .relays:
-                RelaySettingsView()
+                RelaySettingsView(model: model.relays)
             case .keyPackages:
-                KeyPackageSettingsView()
+                KeyPackageSettingsView(model: model.keyPackageSettings)
             case .appearance:
                 AppearanceSettingsView()
             case .privacySecurity:
-                PrivacySecuritySettingsView()
+                PrivacySecuritySettingsView(model: model.diagnostics)
+            case .blockedUsers:
+                BlockedUsersSettingsView(model: model.blockedUsersModel)
             case .notifications:
                 NotificationsSettingsView()
             case .storage:
-                StorageSettingsView()
+                StorageSettingsView(model: model.storage)
+            case .agents:
+                AIAgentsSettingsView(model: model.agentSettings)
+            case .support:
+                SupportSettingsView()
             case .donate:
                 DonateSettingsView()
             case .developerMode:
-                DeveloperModeSettingsView()
+                DeveloperModeSettingsView(model: model.diagnostics)
+            case .quarantinedGroups:
+                QuarantinedGroupsSettingsView(model: model.quarantinedGroups)
             }
         }
         // The same surface the transcript and the group/contact detail panes draw on, rather than
@@ -56,8 +69,32 @@ struct SettingsPanelView: View {
         .background {
             MessagesTranscriptBackground()
         }
-        .task(id: workspace.activeAccountId) {
+        .task(id: loadKey) {
+            guard page.usesLegacyWorkspaceSettings else { return }
             await workspace.loadSettingsData()
         }
     }
+}
+
+private struct SettingsPanelLoadKey: Equatable {
+    let accountID: String?
+    let page: SettingsPage
+}
+
+private extension SettingsPage {
+    var usesLegacyWorkspaceSettings: Bool {
+        switch self {
+        case .overview, .profile, .identityKeys, .notifications:
+            true
+        case .preferences, .relays, .keyPackages, .appearance, .privacySecurity, .blockedUsers, .storage,
+            .agents, .support, .donate, .developerMode, .quarantinedGroups:
+            false
+        }
+    }
+}
+
+#Preview {
+    SettingsPanelView(model: .preview())
+        .environment(WorkspaceState.preview())
+        .frame(width: 760, height: 640)
 }

@@ -111,55 +111,46 @@ extension WorkspaceState {
     ) async {
         guard let message = pendingOutgoingTextMessage(id, in: draftKey) else { return }
 
-        // Stamped before the publish, not after it: the core commits an own send locally as part of
-        // publishing, so the real row can reach the transcript through the subscription while we are
-        // still awaiting the relay. This count is what lets it retire this bubble on arrival instead
-        // of leaving the same sentence rendered twice for the length of the round-trip.
-        setPendingOutgoingTextMessagePublishBaseline(
-            ownBodyCount(of: message.text, inChat: draftKey.chatId),
-            for: id,
-            in: draftKey
-        )
         setPendingOutgoingTextMessageState(.publishing, for: id, in: draftKey)
 
         do {
             if let replyContext = message.replyContext {
-                _ = try await client.replyToMessage(
+                _ = try await client.replyToMessageWithClientToken(
                     accountRef: account.accountRef,
                     groupIdHex: draftKey.chatId,
                     targetMessageId: replyContext.targetMessageId,
-                    text: message.text
+                    text: message.text,
+                    clientToken: message.clientToken
                 )
             } else {
-                _ = try await client.sendText(
+                _ = try await client.sendTextWithClientToken(
                     accountRef: account.accountRef,
                     groupIdHex: draftKey.chatId,
-                    text: message.text
+                    text: message.text,
+                    clientToken: message.clientToken
                 )
             }
         } catch {
-            // The core rolls its local projection back when a publish fails, so there is no row in
-            // the transcript to carry this message any more — which makes this bubble the only copy
-            // of what the user wrote, and the reason a failure is no longer allowed to fall back on
-            // refilling the composer. That fallback silently dropped the message whenever the
-            // composer was not empty, which it never is once a second send is queued behind a first.
+            // An interrupted host await can race durable local admission. Resolve that ambiguity
+            // with the same token instead of creating another semantic send on retry.
+            if let status = try? client.localSendStatus(
+                accountRef: account.accountRef,
+                groupIdHex: draftKey.chatId,
+                clientToken: message.clientToken
+            ) {
+                switch status {
+                case .queued, .engineOwned, .completed:
+                    return
+                case .rejected:
+                    break
+                }
+            }
             lastError = error.localizedDescription
             setPendingOutgoingTextMessageState(.failed, for: id, in: draftKey)
             return
         }
-        guard !Task.isCancelled else { return }
-
-        // One authoritative re-window so the user sees their just-sent message immediately, even if
-        // the live projection for it is momentarily in flight. The follow-on delivery-state
-        // transitions then arrive as projection deltas and are applied incrementally by
-        // `applyTimelineProjection`. Re-window first, then retire the placeholder: dropping it
-        // before the window came back would leave a frame with neither row in it.
-        await refreshSelectedTimelineAfterSend(
-            groupIdHex: draftKey.chatId,
-            account: account,
-            client: client
-        )
-        removePendingOutgoingTextMessage(id, in: draftKey)
+        // Durable local admission is success, but not the reconciliation signal. Keep the pending
+        // row until a complete conversation snapshot carries this exact client token.
     }
 
     private func pendingOutgoingTextMessage(
@@ -177,16 +168,6 @@ extension WorkspaceState {
         guard let index = pendingOutgoingTextMessagesByConversation[draftKey]?.firstIndex(where: { $0.id == id })
         else { return }
         pendingOutgoingTextMessagesByConversation[draftKey]?[index].state = state
-    }
-
-    private func setPendingOutgoingTextMessagePublishBaseline(
-        _ count: Int,
-        for id: PendingOutgoingTextMessage.ID,
-        in draftKey: ComposerDraftKey
-    ) {
-        guard let index = pendingOutgoingTextMessagesByConversation[draftKey]?.firstIndex(where: { $0.id == id })
-        else { return }
-        pendingOutgoingTextMessagesByConversation[draftKey]?[index].ownBodyCountBeforePublish = count
     }
 
     private func removePendingOutgoingTextMessage(

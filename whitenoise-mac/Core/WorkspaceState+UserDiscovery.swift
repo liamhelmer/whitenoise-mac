@@ -377,7 +377,7 @@ extension WorkspaceState {
 
     /// Returns `true` when this update was terminal.
     ///
-    /// Switched exhaustively over all 8 triggers with no `default`, so a bindings update that adds
+    /// Switched exhaustively over every trigger with no `default`, so a bindings update that adds
     /// one breaks the build instead of being silently ignored.
     private func applyUserDiscovery(trigger: SearchUpdateTriggerFfi) -> Bool {
         switch trigger {
@@ -392,7 +392,7 @@ extension WorkspaceState {
             return false
         case .searchCompleted:
             return true
-        case .radiusStarted, .resultsFound, .discoveryResultsFound, .radiusCompleted:
+        case .radiusStarted, .resultsFound, .discoveryResultsFound, .cachedResultsFound, .radiusCompleted:
             return false
         }
     }

@@ -485,14 +485,26 @@ struct SettingsTests: WorkspaceTestSupport {
         state.showSettings(.privacySecurity)
         #expect(state.selection == .settings(.privacySecurity))
 
+        state.showSettings(.blockedUsers)
+        #expect(state.selection == .settings(.blockedUsers))
+
         state.showSettings(.notifications)
         #expect(state.selection == .settings(.notifications))
 
         state.showSettings(.storage)
         #expect(state.selection == .settings(.storage))
 
+        state.showSettings(.agents)
+        #expect(state.selection == .settings(.agents))
+
+        state.showSettings(.support)
+        #expect(state.selection == .settings(.support))
+
         state.showSettings(.developerMode)
         #expect(state.selection == .settings(.developerMode))
+
+        state.showSettings(.quarantinedGroups)
+        #expect(state.selection == .settings(.quarantinedGroups))
     }
 
     /// Profile leads, not the startup toggles: settings used to open on "General", which put a
@@ -517,21 +529,27 @@ struct SettingsTests: WorkspaceTestSupport {
                 .privacySecurity,
                 .storage,
                 .relays,
+                .agents,
                 .preferences,
+                .support,
                 .donate,
                 .developerMode,
             ]
         )
     }
 
-    /// Key Packages is not a hub row at all: `wn-ios-prototype` reaches it from an isolated
+    /// Technical subpages are not hub rows: `wn-ios-prototype` reaches them from isolated
     /// navigation row inside Developer Tools rather than as a peer of Profile and Relays, so
     /// the drawer keeps Developer mode lit while its destination is the open page. Every other
     /// page is its own row.
     @MainActor
-    @Test func keyPackagesIsADeveloperModeDestinationRatherThanADrawerRow() async throws {
+    @Test func technicalSubpagesStayWithTheirOwningDrawerRows() async throws {
         #expect(!SettingsPage.sidebarPages.contains(.keyPackages))
         #expect(SettingsPage.keyPackages.drawerPage == .developerMode)
+        #expect(!SettingsPage.sidebarPages.contains(.quarantinedGroups))
+        #expect(SettingsPage.quarantinedGroups.drawerPage == .developerMode)
+        #expect(!SettingsPage.sidebarPages.contains(.blockedUsers))
+        #expect(SettingsPage.blockedUsers.drawerPage == .privacySecurity)
 
         for page in SettingsPage.sidebarPages {
             #expect(page.drawerPage == page)
@@ -551,6 +569,11 @@ struct SettingsTests: WorkspaceTestSupport {
         state.developerMode = true
         state.showSettings(.keyPackages)
 
+        state.developerMode = false
+        #expect(state.selection == .settings(.developerMode))
+
+        state.developerMode = true
+        state.showSettings(.quarantinedGroups)
         state.developerMode = false
         #expect(state.selection == .settings(.developerMode))
 
@@ -891,197 +914,6 @@ struct SettingsTests: WorkspaceTestSupport {
         #expect(state.activeAccount?.displayName == "Desktop Account")
         #expect(state.activeAccount?.pictureURL == "https://example.com/avatar.png")
         #expect(state.profileDraft.picture == "https://example.com/avatar.png")
-    }
-
-    @MainActor
-    @Test func keyPackageLoadShowsPublishedKeyPackages() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.loadSettingsData()
-        await state.loadKeyPackages()
-
-        #expect(state.keyPackages.map(\.eventIdHex) == ["event-local", "event-fetched"])
-        #expect(state.keyPackages.first?.sourceLabel == "Local")
-        #expect(runtime.lastPackageFetchBootstrapRelays == MarmotClient.seedRelays)
-    }
-
-    @MainActor
-    @Test func keyPackageLabelsUseSelectedAppLanguage() async throws {
-        let previousLanguage = UserDefaults.standard.object(forKey: AppLanguage.storageKey)
-        defer { restoreDefault(previousLanguage, forKey: AppLanguage.storageKey) }
-        UserDefaults.standard.set(AppLanguage.spanish.rawValue, forKey: AppLanguage.storageKey)
-        AppLanguage.refreshCachedLocale()
-
-        let publishedAt = Date(timeIntervalSince1970: 1_700_000_000)
-        let package = KeyPackageItem(
-            accountRef: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            keyPackageId: "key-package",
-            keyPackageRefHex: "key-package-ref",
-            eventIdHex: "event-fetched",
-            publishedAt: publishedAt,
-            keyPackageBytes: 128,
-            sourceRelays: ["wss://relay.example"],
-            isLocal: false,
-            isRelayDiscovered: true
-        )
-        let expectedPublished = publishedAt.formatted(
-            Date.FormatStyle(date: .abbreviated, time: .shortened)
-                .locale(Locale(identifier: AppLanguage.spanish.rawValue))
-        )
-
-        #expect(package.sourceLabel == "Sincronizado")
-        #expect(package.statusLabels == ["Sincronizado"])
-        #expect(package.publishedLabel == expectedPublished)
-
-        let localAndSyncedPackage = KeyPackageItem(
-            accountRef: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            keyPackageId: "local-synced-package",
-            keyPackageRefHex: "local-synced-key-package-ref",
-            eventIdHex: "event-local-synced",
-            publishedAt: publishedAt,
-            keyPackageBytes: 128,
-            sourceRelays: ["wss://relay.example"],
-            isLocal: true,
-            isRelayDiscovered: true
-        )
-
-        #expect(localAndSyncedPackage.statusLabels == ["Local", "Sincronizado"])
-        #expect(localAndSyncedPackage.sourceLabel == "Local + Sincronizado")
-
-        let unknownPackage = KeyPackageItem(
-            accountRef: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            keyPackageId: "unknown-package",
-            keyPackageRefHex: "unknown-key-package-ref",
-            eventIdHex: "event-unknown",
-            publishedAt: nil,
-            keyPackageBytes: 0,
-            sourceRelays: [],
-            isLocal: false,
-            isRelayDiscovered: false
-        )
-
-        #expect(unknownPackage.sourceLabel == "Desconocido")
-        #expect(unknownPackage.publishedLabel == "Desconocido")
-    }
-
-    @MainActor
-    @Test func keyPackageLoadUsesAccountRelayBootstrapRelays() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let bootstrapRelays = ["wss://bootstrap.example"]
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.installRelayLists(
-            defaultRelays: ["wss://published.example"],
-            bootstrapRelays: bootstrapRelays,
-            nip65: ["wss://nip65.example"],
-            inbox: ["wss://inbox.example"]
-        )
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.loadSettingsData()
-        await state.loadKeyPackages()
-
-        #expect(runtime.lastPackageFetchBootstrapRelays == bootstrapRelays)
-    }
-
-    @MainActor
-    @Test func settingsLoadDoesNotFetchKeyPackages() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.loadSettingsData()
-
-        #expect(runtime.accountKeyPackagesCallCount == 0)
-        #expect(state.keyPackages.isEmpty)
-    }
-
-    @MainActor
-    @Test func staleKeyPackageLoadDoesNotClobberSwitchedAccountList() async throws {
-        // Issue #207: `loadKeyPackages` is driven by `.task(id: activeAccountId)` and awaits the
-        // completion-ordered `accountKeyPackages` FFI. On an A→B account switch, account A's
-        // slower-resolving load must not overwrite account B's key-package list.
-        let accountA = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let accountB = AccountSummaryFfi(
-            label: "Backup Account",
-            accountIdHex: "1111111111111111111111111111111111111111111111111111111111111111",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [accountA, accountB])
-        runtime.installKeyPackages(
-            accountRef: "Desktop Account",
-            packages: [keyPackageFixture(accountRef: "Desktop Account", eventIdHex: "event-account-a")]
-        )
-        runtime.installKeyPackages(
-            accountRef: "Backup Account",
-            packages: [keyPackageFixture(accountRef: "Backup Account", eventIdHex: "event-account-b")]
-        )
-        UserDefaults.standard.set("Desktop Account", forKey: "whitenoise.mac.activeAccountId")
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        #expect(state.activeAccountId == "Desktop Account")
-
-        // Arm the gate so account A's load suspends in-flight after capturing A's packages.
-        runtime.accountKeyPackagesGateEnabled = true
-        async let staleLoad: Void = state.loadKeyPackages()
-        while !runtime.didReachAccountKeyPackagesGate {
-            await Task.yield()
-        }
-
-        // Switch to account B and run a fresh load to completion. The gate only holds the first
-        // call, so B's load is not gated.
-        let backupAccount = try #require(state.accounts.first { $0.id == "Backup Account" })
-        state.selectAccountFromSettings(backupAccount)
-        #expect(state.activeAccountId == "Backup Account")
-        await state.loadKeyPackages()
-        #expect(state.keyPackages.map(\.eventIdHex) == ["event-account-b"])
-
-        // Release account A's stale load. Its completion is now superseded, so it must neither
-        // overwrite B's list nor report an error.
-        runtime.releaseAccountKeyPackagesGate()
-        _ = await staleLoad
-
-        #expect(state.keyPackages.map(\.eventIdHex) == ["event-account-b"])
-        #expect(state.lastError == nil)
     }
 
     @MainActor
@@ -1540,6 +1372,10 @@ struct SettingsTests: WorkspaceTestSupport {
                 "WhiteNoiseTelemetryBearerToken": "otlp-token",
                 "WhiteNoiseAuditLogBearerToken": "audit-token",
                 "WhiteNoiseTelemetryEnvironment": "production",
+                "WhiteNoiseProductAnalyticsEndpoint": "https://events.example",
+                "WhiteNoiseProductAnalyticsAppKey": "product-key",
+                "WhiteNoiseProductAnalyticsOperator": "white_noise",
+                "WhiteNoiseProductAnalyticsRetention": "180 days",
                 "CFBundleShortVersionString": "2026.6",
                 "CFBundleVersion": "12",
             ],
@@ -1555,6 +1391,9 @@ struct SettingsTests: WorkspaceTestSupport {
         #expect(config.serviceVersion == "2026.6+12")
         #expect(config.osVersion == "Version 26.0")
         #expect(config.deviceModelIdentifier == "Mac15,3")
+        #expect(config.productAnalyticsEndpoint == "https://events.example")
+        #expect(config.productAnalyticsAppKey == "product-key")
+        #expect(config.productAnalyticsRetentionDisclosure == "180 days")
 
         let runtimeConfig = config.runtimeConfig(installId: "install-id")
         #expect(runtimeConfig.authorizationBearerToken == "otlp-token")
@@ -1568,9 +1407,20 @@ struct SettingsTests: WorkspaceTestSupport {
 
         let auditConfig = config.auditTrackerConfig()
         #expect(auditConfig.authorizationBearerToken == "audit-token")
-        #expect(auditConfig.source.deviceLabel == "Mac15,3")
-        #expect(auditConfig.source.platform == "macOS")
+        #expect(auditConfig.source.hardwareModel == "Mac15,3")
+        #expect(auditConfig.source.platform == "macos")
         #expect(auditConfig.source.appVersion == "2026.6+12")
+
+        let productConfig = config.productAnalyticsRuntimeConfig()
+        #expect(productConfig.eventsEndpoint == "https://events.example")
+        #expect(productConfig.appKey == "product-key")
+        #expect(productConfig.operator == "white_noise")
+        #expect(productConfig.metadata.appVersion == "2026.6+12")
+        #expect(productConfig.metadata.osFamily == "macos")
+        #expect(productConfig.metadata.deviceClass == "desktop")
+        #expect(productConfig.metadata.hostSurface == "native")
+        #expect(productConfig.metadata.environment == "production")
+        #expect(productConfig.registry.map(\.name) == ProductAnalyticsTimingStage.allCases.map(\.rawValue))
     }
 
     @MainActor
@@ -1616,6 +1466,8 @@ struct SettingsTests: WorkspaceTestSupport {
                 "WhiteNoiseTelemetryBearerToken": "$(WN_OTLP_BEARER_TOKEN)",
                 "WhiteNoiseAuditLogBearerToken": "$(WN_AUDIT_LOG_BEARER_TOKEN)",
                 "WhiteNoiseTelemetryEnvironment": "$(WN_TELEMETRY_ENVIRONMENT)",
+                "WhiteNoiseProductAnalyticsEndpoint": "$(WN_PRODUCT_ANALYTICS_ENDPOINT)",
+                "WhiteNoiseProductAnalyticsAppKey": "$(WN_PRODUCT_ANALYTICS_APP_KEY)",
                 "CFBundleShortVersionString": "1.2.3",
                 "CFBundleVersion": "$(CURRENT_PROJECT_VERSION)",
             ],
@@ -1624,6 +1476,8 @@ struct SettingsTests: WorkspaceTestSupport {
                 "OTLP_TOKEN_WN_MAC": "env-otlp-token",
                 "AUDIT_LOG_TOKEN_WN_MAC": "env-audit-token",
                 "WN_TELEMETRY_ENVIRONMENT": "staging",
+                "WN_PRODUCT_ANALYTICS_ENDPOINT": "https://events.example",
+                "WN_PRODUCT_ANALYTICS_APP_KEY": "env-product-key",
             ],
             osVersion: "Version 26.0",
             deviceModelIdentifier: nil
@@ -1634,6 +1488,8 @@ struct SettingsTests: WorkspaceTestSupport {
         #expect(config.auditLogBearerToken == "env-audit-token")
         #expect(config.deploymentEnvironment == "staging")
         #expect(config.serviceVersion == "1.2.3")
+        #expect(config.productAnalyticsEndpoint == "https://events.example")
+        #expect(config.productAnalyticsAppKey == "env-product-key")
     }
 
     @MainActor
@@ -1669,449 +1525,6 @@ struct SettingsTests: WorkspaceTestSupport {
 
         let runtimeResource = config.runtimeConfig(installId: "install-id").resource
         #expect(runtimeResource?.deploymentEnvironment == "unknown")
-    }
-
-    @MainActor
-    @Test func privacySecuritySettingsLoadAndPersistTelemetryAndAuditToggles() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.storedRelayTelemetrySettings = RelayTelemetrySettingsFfi(
-            exportEnabled: true,
-            exportIntervalSeconds: 120
-        )
-        runtime.storedAuditLogSettings = AuditLogSettingsFfi(enabled: false)
-        runtime.storedAuditLogFiles = [
-            AuditLogFileFfi(
-                accountRef: account.label,
-                path: "/tmp/audit-1.jsonl",
-                fileName: "audit-1.jsonl",
-                sizeBytes: 512,
-                modifiedAtMs: 1_800_000_000_000
-            )
-        ]
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(
-                    telemetryToken: "otlp-token",
-                    auditToken: "audit-token",
-                    environment: "production"
-                )
-            },
-            clientFactory: { runtime }
-        )
-
-        await state.bootstrap()
-
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(state.privacySecuritySettings.relayTelemetryIntervalSeconds == 120)
-        #expect(!state.privacySecuritySettings.auditLoggingEnabled)
-        #expect(state.privacySecuritySettings.telemetryCredentialsAvailable)
-        #expect(state.privacySecuritySettings.auditLogCredentialsAvailable)
-        #expect(state.auditLogFiles.count == 1)
-        #expect(runtime.relayTelemetryRuntimeConfig?.authorizationBearerToken == "otlp-token")
-        let telemetryResource = runtime.relayTelemetryRuntimeConfig?.resource
-        #expect(telemetryResource?.serviceVersion == expectedTelemetryServiceVersion())
-        #expect(telemetryResource?.serviceInstanceId == "test-install-id")
-        #expect(telemetryResource?.deploymentEnvironment == "production")
-        #expect(telemetryResource?.tenant == "whitenoise-mac")
-        #expect(telemetryResource?.osType == "darwin")
-        #expect(telemetryResource?.osVersion == TelemetryBuildConfig.marketingOSVersion())
-        #expect(telemetryResource?.deviceModelIdentifier == nil)
-        #expect(runtime.auditLogTrackerConfig?.authorizationBearerToken == "audit-token")
-        #expect(runtime.auditLogTrackerConfig?.source.deviceLabel == expectedDeviceModelIdentifier())
-
-        await state.setRelayTelemetryEnabled(false)
-        await state.setAuditLoggingEnabled(true)
-
-        #expect(!runtime.storedRelayTelemetrySettings.exportEnabled)
-        #expect(runtime.storedRelayTelemetrySettings.exportIntervalSeconds == 120)
-        #expect(runtime.storedAuditLogSettings.enabled)
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(state.privacySecuritySettings.auditLoggingEnabled)
-    }
-
-    /// The enable path is covered above; this pins the *disable* path, which is the only
-    /// place a stale `true` can survive in the core after the user turns audit logging off.
-    @MainActor
-    @Test func auditLoggingTogglePersistsBothOnAndOffThroughTheRuntime() async throws {
-        let account = desktopAccount()
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.storedAuditLogSettings = AuditLogSettingsFfi(enabled: false)
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(telemetryToken: "otlp-token", auditToken: "audit-token")
-            },
-            clientFactory: { runtime }
-        )
-
-        await state.bootstrap()
-        await state.setAuditLoggingEnabled(true)
-
-        #expect(runtime.storedAuditLogSettings.enabled)
-        #expect(state.privacySecuritySettings.auditLoggingEnabled)
-
-        await state.setAuditLoggingEnabled(false)
-
-        #expect(!runtime.storedAuditLogSettings.enabled)
-        #expect(!state.privacySecuritySettings.auditLoggingEnabled)
-    }
-
-    /// The telemetry switch renders from `privacySecuritySettings`, so that value has to move when
-    /// the user flips it, not a relay round trip later — otherwise the switch springs back under the
-    /// pointer and then flips on its own. The gate here holds the FFI read open so "before the write
-    /// lands" is a state we can actually stand in, rather than something inferred from timing.
-    @MainActor
-    @Test func relayTelemetryToggleMovesBeforeTheWriteLands() async throws {
-        let account = desktopAccount()
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(telemetryToken: "otlp-token", auditToken: "audit-token")
-            },
-            clientFactory: { runtime }
-        )
-        await state.bootstrap()
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-
-        runtime.relayTelemetrySettingsGateEnabled = true
-        async let enabling: Void = state.setRelayTelemetryEnabled(true)
-        while !runtime.didReachRelayTelemetrySettingsGate {
-            await Task.yield()
-        }
-
-        // Parked inside the FFI read, so nothing has been written anywhere yet.
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(!runtime.storedRelayTelemetrySettings.exportEnabled)
-
-        runtime.releaseRelayTelemetrySettingsGate()
-        await enabling
-
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(runtime.storedRelayTelemetrySettings.exportEnabled)
-    }
-
-    /// The other half of moving early: a write that never lands has to put the switch back, or the
-    /// user is left looking at a setting the core does not have. Both toggles roll back, and the
-    /// failure still surfaces through `lastError`.
-    @MainActor
-    @Test func privacySecurityTogglesRollBackWhenTheWriteFails() async throws {
-        let account = desktopAccount()
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.setRelayTelemetrySettingsError = FakeMarmotRuntimeError.unused
-        runtime.setAuditLogSettingsError = FakeMarmotRuntimeError.unused
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(telemetryToken: "otlp-token", auditToken: "audit-token")
-            },
-            clientFactory: { runtime }
-        )
-        await state.bootstrap()
-
-        await state.setRelayTelemetryEnabled(true)
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(state.lastError != nil)
-
-        state.lastError = nil
-        await state.setAuditLoggingEnabled(true)
-        #expect(!state.privacySecuritySettings.auditLoggingEnabled)
-        #expect(state.lastError != nil)
-    }
-
-    /// Moving the toggle early buys a second obligation: the write that lands late must check it is
-    /// still wanted. `privacySecuritySettings` is per-account UI state — `resetActiveAccountUIState`
-    /// puts it back to `.defaults` — so a save suspended across a switch that then writes anything,
-    /// success or rollback, hands the incoming account a value it never loaded and an error from an
-    /// identity it never used. Same protocol as `saveRelaySettings` and `saveProfile`.
-    @MainActor
-    @Test func privacySecurityToggleWritesNothingAfterAnAccountSwitch() async throws {
-        // `selectAccount` persists the incoming id through `WorkspaceState.activeAccountKey`, so
-        // this test would otherwise leave a fake account id in the host's defaults for whatever
-        // runs next. Same guard every other switch test in this suite takes.
-        let previousActiveAccount = UserDefaults.standard.object(forKey: WorkspaceState.activeAccountKey)
-        defer { restoreDefault(previousActiveAccount, forKey: WorkspaceState.activeAccountKey) }
-        let first = desktopAccount()
-        let second = AccountSummaryFfi(
-            label: "Secondary Account",
-            accountIdHex: String(repeating: "7", count: 64),
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [first, second])
-        // The outgoing account has telemetry on, so a rollback that escapes writes `true` — which
-        // the incoming account's `.defaults` snapshot does not carry. That difference is the witness.
-        runtime.storedRelayTelemetrySettings = RelayTelemetrySettingsFfi(
-            exportEnabled: true,
-            exportIntervalSeconds: 120
-        )
-        runtime.setRelayTelemetrySettingsError = FakeMarmotRuntimeError.unused
-        let state = WorkspaceState(clientFactory: { runtime })
-        await state.bootstrap()
-        await state.loadPrivacySecuritySettings()
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-
-        // Turning telemetry *off* needs no credentials, so the guard at the top of the save is not
-        // in the way. The gate parks the save inside its first FFI read, which is where a real
-        // switch would catch it.
-        runtime.relayTelemetrySettingsGateEnabled = true
-        async let disabling: Void = state.setRelayTelemetryEnabled(false)
-        while !runtime.didReachRelayTelemetrySettingsGate {
-            await Task.yield()
-        }
-
-        let incoming = try #require(state.accounts.first { $0.id != state.activeAccountId })
-        state.selectAccount(incoming)
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-        state.lastError = nil
-
-        runtime.releaseRelayTelemetrySettingsGate()
-        await disabling
-
-        // The failed save belongs to the identity that started it, and that identity is gone.
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(state.lastError == nil)
-    }
-
-    /// Refusing a stale completion is only half of it: nobody must be left holding the save flag.
-    /// A switch does not clear `isSavingPrivacySecurity` — `prepareForActiveAccountSwitch` never
-    /// touches it — so if the outgoing account's completion is refused *and* nothing invalidates the
-    /// flag, it stays true for the rest of the session and `guard !isSavingPrivacySecurity` silently
-    /// kills both toggles for every account. The incoming account has to be able to save while the
-    /// outgoing account's write is still in the air.
-    @MainActor
-    @Test func privacySecuritySaveFlagDoesNotOutliveTheAccountThatOwnsIt() async throws {
-        let previousActiveAccount = UserDefaults.standard.object(forKey: WorkspaceState.activeAccountKey)
-        defer { restoreDefault(previousActiveAccount, forKey: WorkspaceState.activeAccountKey) }
-        let first = desktopAccount()
-        let second = AccountSummaryFfi(
-            label: "Secondary Account",
-            accountIdHex: String(repeating: "7", count: 64),
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [first, second])
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(telemetryToken: "otlp-token", auditToken: "audit-token")
-            },
-            clientFactory: { runtime }
-        )
-        await state.bootstrap()
-
-        // Park the outgoing account's save inside its first FFI read and switch out from under it.
-        runtime.relayTelemetrySettingsGateEnabled = true
-        async let outgoing: Void = state.setRelayTelemetryEnabled(true)
-        while !runtime.didReachRelayTelemetrySettingsGate {
-            await Task.yield()
-        }
-        let incoming = try #require(state.accounts.first { $0.id != state.activeAccountId })
-        state.selectAccount(incoming)
-
-        // The incoming account owns the pane now, so its toggle has to work — the gate is already
-        // spent, so this save runs to completion while the outgoing one is still suspended.
-        #expect(!state.isSavingPrivacySecurity)
-        await state.setRelayTelemetryEnabled(true)
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(runtime.storedRelayTelemetrySettings.exportEnabled)
-
-        runtime.releaseRelayTelemetrySettingsGate()
-        await outgoing
-
-        // And the refused completion did not take the incoming account's flag down with it.
-        #expect(!state.isSavingPrivacySecurity)
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-    }
-
-    @MainActor
-    @Test func privacySecuritySettingsLoadSurvivesObservabilityConfigurationFailure() async throws {
-        let account = desktopAccount()
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        var buildConfig = telemetryBuildConfig(environment: "production")
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: { buildConfig },
-            clientFactory: { runtime }
-        )
-
-        await state.bootstrap()
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(!state.privacySecuritySettings.auditLoggingEnabled)
-        #expect(state.auditLogFiles.isEmpty)
-
-        runtime.storedRelayTelemetrySettings = RelayTelemetrySettingsFfi(
-            exportEnabled: true,
-            exportIntervalSeconds: 120
-        )
-        runtime.storedAuditLogSettings = AuditLogSettingsFfi(enabled: true)
-        runtime.storedAuditLogFiles = [
-            AuditLogFileFfi(
-                accountRef: account.label,
-                path: "/tmp/audit-1.jsonl",
-                fileName: "audit-1.jsonl",
-                sizeBytes: 512,
-                modifiedAtMs: 1_800_000_000_000
-            )
-        ]
-        buildConfig = telemetryBuildConfig(environment: "staging")
-        runtime.telemetryInstallIdError = FakeMarmotRuntimeError.observabilityConfigurationFailed
-
-        await state.loadPrivacySecuritySettings()
-
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(state.privacySecuritySettings.relayTelemetryIntervalSeconds == 120)
-        #expect(state.privacySecuritySettings.auditLoggingEnabled)
-        #expect(state.auditLogFiles.map(\.path) == ["/tmp/audit-1.jsonl"])
-        #expect(state.lastError == "Observability configuration failed.")
-    }
-
-    @MainActor
-    @Test func concurrentPrivacySecurityLoadsCoalesce() async throws {
-        let account = desktopAccount()
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        let state = WorkspaceState(clientFactory: { runtime })
-        await state.bootstrap()
-
-        runtime.clearSyncCallThreadRecords()
-        runtime.relayTelemetrySettingsGateEnabled = true
-        async let first: Void = state.loadPrivacySecuritySettings()
-        while !runtime.didReachRelayTelemetrySettingsGate {
-            await Task.yield()
-        }
-        async let second: Void = state.loadPrivacySecuritySettings()
-        await Task.yield()
-
-        #expect(runtime.syncCallThreadRecord("relayTelemetrySettings").count == 1)
-        runtime.releaseRelayTelemetrySettingsGate()
-        _ = await (first, second)
-        #expect(runtime.syncCallThreadRecord("relayTelemetrySettings").count == 1)
-    }
-
-    @MainActor
-    @Test func privacySecuritySettingsLoadDoesNotOverwriteNewerTelemetrySave() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.storedRelayTelemetrySettings = RelayTelemetrySettingsFfi(
-            exportEnabled: false,
-            exportIntervalSeconds: 120
-        )
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(
-                    telemetryToken: "otlp-token",
-                    auditToken: "audit-token",
-                    environment: "production"
-                )
-            },
-            clientFactory: { runtime }
-        )
-
-        await state.bootstrap()
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-
-        runtime.relayTelemetrySettingsGateEnabled = true
-        async let staleLoad: Void = state.loadPrivacySecuritySettings()
-        while !runtime.didReachRelayTelemetrySettingsGate {
-            await Task.yield()
-        }
-
-        await state.setRelayTelemetryEnabled(true)
-        #expect(runtime.storedRelayTelemetrySettings.exportEnabled)
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-
-        runtime.releaseRelayTelemetrySettingsGate()
-        _ = await staleLoad
-
-        #expect(runtime.storedRelayTelemetrySettings.exportEnabled)
-        #expect(state.privacySecuritySettings.relayTelemetryEnabled)
-    }
-
-    /// A telemetry save that is still mid-flight when the user switches identity must not follow
-    /// them there. `isSavingPrivacySecurity` gates the whole page — the loader and both setters
-    /// refuse to run while it is raised — so a save left owning it locked the incoming account out
-    /// of a page it had never touched, and the outgoing account's answer then published into it.
-    @MainActor
-    @Test func privacySecuritySaveInFlightDoesNotFollowTheUserToTheNextAccount() async throws {
-        let previousActiveAccount = UserDefaults.standard.object(forKey: WorkspaceState.activeAccountKey)
-        defer { restoreDefault(previousActiveAccount, forKey: WorkspaceState.activeAccountKey) }
-
-        let primary = AccountSummaryFfi(
-            label: "Primary Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let backup = AccountSummaryFfi(
-            label: "Backup Account",
-            accountIdHex: "1111111111111111111111111111111111111111111111111111111111111111",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [primary, backup])
-        runtime.storedRelayTelemetrySettings = RelayTelemetrySettingsFfi(
-            exportEnabled: false,
-            exportIntervalSeconds: 120
-        )
-        // Pinned so a value another test left behind cannot decide which account boots active.
-        UserDefaults.standard.set(primary.label, forKey: WorkspaceState.activeAccountKey)
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(
-                    telemetryToken: "otlp-token",
-                    auditToken: "audit-token",
-                    environment: "production"
-                )
-            },
-            clientFactory: { runtime }
-        )
-
-        await state.bootstrap()
-        #expect(state.activeAccountId == primary.label)
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-
-        runtime.relayTelemetrySettingsGateEnabled = true
-        async let save: Void = state.setRelayTelemetryEnabled(true)
-        while !runtime.didReachRelayTelemetrySettingsGate {
-            await Task.yield()
-        }
-        #expect(state.isSavingPrivacySecurity)
-
-        let backupAccount = try #require(state.accounts.first { $0.id == backup.label })
-        state.selectAccount(backupAccount)
-
-        // The page is the new identity's from the moment it is active, not once the old save
-        // happens to finish.
-        #expect(state.activeAccountId == backup.label)
-        #expect(!state.isSavingPrivacySecurity)
-
-        runtime.releaseRelayTelemetrySettingsGate()
-        await save
-
-        // The write still lands where the user asked for it — what it must not do is publish into
-        // the account now on screen, re-raise its saving flag, or report its errors there.
-        #expect(runtime.storedRelayTelemetrySettings.exportEnabled)
-        #expect(!state.privacySecuritySettings.relayTelemetryEnabled)
-        #expect(!state.isSavingPrivacySecurity)
-        #expect(state.lastError == nil)
     }
 
     @MainActor
@@ -2175,6 +1588,7 @@ struct SettingsTests: WorkspaceTestSupport {
         #expect(runtime.telemetryInstallIdCallCount == 1)
         #expect(runtime.relayTelemetryRuntimeConfigSetCallCount == 1)
         #expect(runtime.auditLogTrackerConfigSetCallCount == 1)
+        #expect(runtime.productAnalyticsRuntimeConfigSetCallCount == 1)
 
         // Account identity now lives in the core's JSONL source_context (Goggles
         // contract), so the host-supplied audit tracker config is account-
@@ -2190,6 +1604,7 @@ struct SettingsTests: WorkspaceTestSupport {
         #expect(runtime.telemetryInstallIdCallCount == 1)
         #expect(runtime.relayTelemetryRuntimeConfigSetCallCount == 1)
         #expect(runtime.auditLogTrackerConfigSetCallCount == 1)
+        #expect(runtime.productAnalyticsRuntimeConfigSetCallCount == 1)
     }
 
     @MainActor
@@ -2254,132 +1669,10 @@ struct SettingsTests: WorkspaceTestSupport {
         try await stalePrimaryConfiguration
 
         #expect(state.activeAccountId == secondary.label)
-        #expect(state.observabilityRuntimeConfiguration?.accountLabel == secondaryItem.displayName)
-    }
-
-    @MainActor
-    @Test func enablingPrivacySecurityTogglesRequireConfiguredTokens() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(telemetryToken: nil, auditToken: nil)
-            },
-            clientFactory: { runtime }
-        )
-
-        await state.bootstrap()
-
-        await state.setRelayTelemetryEnabled(true)
-        #expect(!runtime.storedRelayTelemetrySettings.exportEnabled)
-        #expect(state.lastError == "Telemetry credentials are not configured for this build.")
-
-        await state.setAuditLoggingEnabled(true)
-
-        #expect(!runtime.storedAuditLogSettings.enabled)
-        #expect(state.lastError == "Audit log credentials are not configured for this build.")
-    }
-
-    @MainActor
-    @Test func auditLogFileActionsRefreshDeleteAndUploadThroughRuntime() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.storedAuditLogSettings = AuditLogSettingsFfi(enabled: true)
-        runtime.storedAuditLogFiles = [
-            AuditLogFileFfi(
-                accountRef: account.label,
-                path: "/tmp/audit-1.jsonl",
-                fileName: "audit-1.jsonl",
-                sizeBytes: 123,
-                modifiedAtMs: nil
-            ),
-            AuditLogFileFfi(
-                accountRef: account.label,
-                path: "/tmp/audit-2.jsonl",
-                fileName: "audit-2.jsonl",
-                sizeBytes: 456,
-                modifiedAtMs: nil
-            ),
-        ]
-        runtime.nextAuditLogTrackerUpdate = AuditLogTrackerUpdateResultFfi(
-            enabled: true,
-            uploaded: [
-                AuditLogUploadResultFfi(path: "/tmp/audit-1.jsonl", status: 200, bytesSent: 123),
-                AuditLogUploadResultFfi(path: "/tmp/audit-2.jsonl", status: 200, bytesSent: 456),
-            ],
-            skippedReason: nil
-        )
-        let state = WorkspaceState(
-            telemetryBuildConfigProvider: {
-                telemetryBuildConfig(telemetryToken: "otlp-token", auditToken: "audit-token")
-            },
-            clientFactory: { runtime }
-        )
-
-        await state.bootstrap()
-        #expect(state.auditLogFiles.count == 2)
-
-        await state.uploadAuditLogFiles()
-        #expect(runtime.didPostAuditLogTrackerUpdate)
-        #expect(state.auditLogUploadStatus == "Uploaded 2 audit log files (579 bytes).")
-
-        await state.deleteAllAuditLogFiles()
-        #expect(runtime.deletedAuditLogFilePaths == ["/tmp/audit-1.jsonl", "/tmp/audit-2.jsonl"])
-        #expect(state.auditLogFiles.isEmpty)
-    }
-
-    @MainActor
-    @Test func deleteAllAuditLogFilesRefreshesListAfterMidLoopFailure() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let firstFile = AuditLogFileFfi(
-            accountRef: account.label,
-            path: "/tmp/audit-1.jsonl",
-            fileName: "audit-1.jsonl",
-            sizeBytes: 123,
-            modifiedAtMs: nil
-        )
-        let secondFile = AuditLogFileFfi(
-            accountRef: account.label,
-            path: "/tmp/audit-2.jsonl",
-            fileName: "audit-2.jsonl",
-            sizeBytes: 456,
-            modifiedAtMs: nil
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.storedAuditLogFiles = [firstFile, secondFile]
-        runtime.auditLogDeleteFailurePaths = [secondFile.path]
-        let expectedDeleteError = FakeMarmotRuntimeError.auditLogDeleteFailed.localizedDescription
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        #expect(state.auditLogFiles.map(\.path) == [firstFile.path, secondFile.path])
-
-        await state.deleteAllAuditLogFiles()
-
-        #expect(runtime.deletedAuditLogFilePaths == [firstFile.path])
-        #expect(state.auditLogFiles.map(\.path) == [secondFile.path])
-        #expect(state.lastError == expectedDeleteError)
+        #expect(
+            await waitFor {
+                state.observabilityRuntimeConfiguration?.accountLabel == secondaryItem.displayName
+            })
     }
 
     @MainActor
@@ -3268,60 +2561,6 @@ struct SettingsTests: WorkspaceTestSupport {
     }
 
     @MainActor
-    @Test func publishingNewKeyPackageRefreshesPackageList() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.publishNewKeyPackage()
-
-        #expect(runtime.didPublishNewKeyPackage)
-        #expect(state.keyPackages.map(\.eventIdHex).contains("event-new"))
-    }
-
-    @MainActor
-    @Test func deletingKeyPackageUsesAccountRelayBootstrapRelaysAndRefreshes() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let bootstrapRelays = ["wss://bootstrap.example"]
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.installRelayLists(
-            defaultRelays: ["wss://published.example"],
-            bootstrapRelays: bootstrapRelays,
-            nip65: ["wss://nip65.example"],
-            inbox: ["wss://inbox.example"]
-        )
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.loadSettingsData()
-        await state.loadKeyPackages()
-        guard let fetchedPackage = state.keyPackages.last else {
-            Issue.record("Expected a fetched key package")
-            return
-        }
-        await state.deleteKeyPackage(fetchedPackage)
-
-        #expect(runtime.deletedPackageEventId == "event-fetched")
-        #expect(runtime.lastPackageDeleteRelays == bootstrapRelays)
-        #expect(!state.keyPackages.map(\.eventIdHex).contains("event-fetched"))
-    }
-
-    @MainActor
     @Test func savingProfileUsesAccountRelayLists() async throws {
         let account = AccountSummaryFfi(
             label: "Desktop Account",
@@ -3811,35 +3050,6 @@ struct SettingsTests: WorkspaceTestSupport {
     }
 
     @MainActor
-    @Test func publishingRelayListsUsesExistingBootstrapRelays() async throws {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let bootstrapRelays = ["wss://bootstrap.example"]
-        let runtime = FakeMarmotRuntime(accounts: [account])
-        runtime.installRelayLists(
-            defaultRelays: ["wss://published.example"],
-            bootstrapRelays: bootstrapRelays,
-            nip65: ["wss://old-nip65.example"],
-            inbox: ["wss://old-inbox.example"]
-        )
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.loadSettingsData()
-        await state.addRelay("wss://new-inbox.example", roles: [.inbox])
-        await state.setRelayRole(.inbox, isEnabled: false, forRelay: "wss://old-inbox.example")
-
-        #expect(runtime.lastSetInboxBootstrapRelays == bootstrapRelays)
-        #expect(state.relaySettings.inbox == ["wss://new-inbox.example"])
-    }
-
-    @MainActor
     @Test func staleProfileSaveDoesNotClobberSwitchedAccount() async throws {
         // Issue #287: `saveProfile` captures `accountRef` for the publish but writes `profileDraft` /
         // the `accounts[]` entry via the live active account afterward. On an A→B switch while the
@@ -3907,68 +3117,6 @@ struct SettingsTests: WorkspaceTestSupport {
         #expect(state.profileDraft.displayName == "Backup Original")
         let backupEntry = try #require(state.accounts.first { $0.id == "Backup Account" })
         #expect(backupEntry.displayName == "Backup Original")
-    }
-
-    @MainActor
-    @Test func staleRelaySaveDoesNotClobberSwitchedAccount() async throws {
-        // Issue #287: the relay writer behind Add Relay writes `relaySettings` via the live active
-        // account after its FFI await. On an A→B switch while the write is in flight, account A's
-        // just-saved relays must not be misattributed to B.
-        let accountA = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let accountB = AccountSummaryFfi(
-            label: "Backup Account",
-            accountIdHex: "1111111111111111111111111111111111111111111111111111111111111111",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [accountA, accountB])
-        runtime.installRelayLists(
-            defaultRelays: ["wss://published.example"],
-            bootstrapRelays: ["wss://bootstrap.example"],
-            nip65: ["wss://nip65.example"],
-            inbox: ["wss://inbox-a.example"]
-        )
-        UserDefaults.standard.set("Desktop Account", forKey: "whitenoise.mac.activeAccountId")
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
-        await state.loadSettingsData()
-        #expect(state.activeAccountId == "Desktop Account")
-
-        // Arm the gate so account A's relay save suspends in-flight.
-        runtime.setAccountRelaysGateEnabled = true
-        async let staleSave: Void = state.addRelay("wss://saved-by-a.example", roles: [.inbox])
-        while !runtime.didReachSetAccountRelaysGate {
-            await Task.yield()
-        }
-
-        // Switch to account B and load its (distinct) inbox to completion.
-        let backupAccount = try #require(state.accounts.first { $0.id == "Backup Account" })
-        state.selectAccountFromSettings(backupAccount)
-        #expect(state.activeAccountId == "Backup Account")
-        runtime.installRelayLists(
-            defaultRelays: ["wss://published.example"],
-            bootstrapRelays: ["wss://bootstrap.example"],
-            nip65: ["wss://nip65.example"],
-            inbox: ["wss://inbox-b.example"]
-        )
-        await state.loadSettingsData()
-        #expect(state.relaySettings.inbox == ["wss://inbox-b.example"])
-
-        // Release account A's stale save; its post-await write must not touch account B's state.
-        runtime.releaseSetAccountRelaysGate()
-        _ = await staleSave
-
-        #expect(state.relaySettings.inbox == ["wss://inbox-b.example"])
     }
 
     @MainActor
@@ -4119,156 +3267,196 @@ struct SettingsTests: WorkspaceTestSupport {
     /// The account + relay lists every relay-editing test below starts from: one relay in each
     /// list, so a role can be turned off without being the last of its kind.
     @MainActor
-    private func relayEditingState() async -> (WorkspaceState, FakeMarmotRuntime) {
-        let account = AccountSummaryFfi(
-            label: "Desktop Account",
-            accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            localSigning: true,
-            externalSigning: false,
-            signedOut: false,
-            running: true
-        )
-        let runtime = FakeMarmotRuntime(accounts: [account])
+    private func relayEditingModel() async -> (RelaySettingsViewModel, FakeMarmotRuntime) {
+        let runtime = FakeMarmotRuntime(accounts: [])
         runtime.installRelayLists(
             defaultRelays: ["wss://published.example"],
             bootstrapRelays: ["wss://bootstrap.example"],
             nip65: ["wss://profile.example", "wss://both.example"],
             inbox: ["wss://inbox.example", "wss://both.example"]
         )
-        let state = WorkspaceState(clientFactory: { runtime })
-        await state.bootstrap()
-        await state.loadSettingsData()
-        return (state, runtime)
+        let model = RelaySettingsViewModel(accountRef: "Desktop Account", runtime: runtime)
+        await model.load()
+        return (model, runtime)
     }
 
     @MainActor
     @Test func addRelayRejectsCleartextPublicWsRelay() async throws {
-        let (state, runtime) = await relayEditingState()
-        let before = state.relaySettings
+        let (model, runtime) = await relayEditingModel()
+        let before = model.settings
 
-        await state.addRelay("ws://relay.example.com", roles: [.profile])
+        await model.addRelay("ws://relay.example.com", roles: [.profile])
 
-        #expect(state.relaySettings == before)
+        #expect(model.settings == before)
         #expect(runtime.lastSetNip65BootstrapRelays.isEmpty)
-        #expect(state.lastError != nil)
+        #expect(model.error == .invalidURL)
     }
 
     @MainActor
     @Test func addRelayAcceptsSecureAndLoopbackRelays() async throws {
-        let (state, _) = await relayEditingState()
+        let (model, _) = await relayEditingModel()
 
-        await state.addRelay("wss://relay.example.com", roles: [.profile])
-        await state.addRelay("ws://127.0.0.1:7000", roles: [.profile])
+        await model.addRelay("wss://relay.example.com", roles: [.profile])
+        await model.addRelay("ws://127.0.0.1:7000", roles: [.profile])
 
         #expect(
-            state.relaySettings.nip65 == [
+            model.settings.nip65 == [
                 "wss://profile.example", "wss://both.example", "wss://relay.example.com", "ws://127.0.0.1:7000",
             ])
-        #expect(!state.isInsecureRelay("wss://relay.example.com"))
-        #expect(state.isInsecureRelay("ws://127.0.0.1:7000"))
+        #expect(!RelayURLValidator.isCleartext("wss://relay.example.com"))
+        #expect(RelayURLValidator.isCleartext("ws://127.0.0.1:7000"))
     }
 
     /// A trailing slash is not a different relay, so adding `wss://both.example/` must be seen as
     /// the duplicate it is rather than appended beside the entry it matches.
     @MainActor
     @Test func addRelayTreatsATrailingSlashAsTheSameRelay() async throws {
-        let (state, _) = await relayEditingState()
-        let before = state.relaySettings
+        let (model, _) = await relayEditingModel()
+        let before = model.settings
 
-        await state.addRelay("wss://both.example/", roles: [.profile, .inbox])
+        await model.addRelay("wss://both.example/", roles: [.profile, .inbox])
 
-        #expect(state.relaySettings == before)
+        #expect(model.settings == before)
     }
 
     /// The prototype's Add Relay sheet activates every selected role in one action, which here is
     /// two published lists from one press.
     @MainActor
     @Test func addRelayAssignsEverySelectedRoleInOneAction() async throws {
-        let (state, _) = await relayEditingState()
+        let (model, _) = await relayEditingModel()
 
-        await state.addRelay("wss://new.example", roles: [.profile, .inbox])
+        await model.addRelay("wss://new.example", roles: [.profile, .inbox])
 
-        #expect(state.relaySettings.nip65.contains("wss://new.example"))
-        #expect(state.relaySettings.inbox.contains("wss://new.example"))
-        let endpoint = try #require(state.relayEndpoints.first { $0.id == "wss://new.example" })
+        #expect(model.settings.nip65.contains("wss://new.example"))
+        #expect(model.settings.inbox.contains("wss://new.example"))
+        let endpoint = try #require(model.endpoints.first { $0.id == "wss://new.example" })
         #expect(endpoint.roles == [.profile, .inbox])
     }
 
     @MainActor
     @Test func setRelayRoleTurnsOneListOffWithoutTouchingTheOther() async throws {
-        let (state, _) = await relayEditingState()
+        let (model, _) = await relayEditingModel()
 
-        await state.setRelayRole(.inbox, isEnabled: false, forRelay: "wss://both.example")
+        await model.setRole(.inbox, isEnabled: false, forRelay: "wss://both.example")
 
-        #expect(state.relaySettings.inbox == ["wss://inbox.example"])
-        #expect(state.relaySettings.nip65 == ["wss://profile.example", "wss://both.example"])
+        #expect(model.settings.inbox == ["wss://inbox.example"])
+        #expect(model.settings.nip65 == ["wss://profile.example", "wss://both.example"])
     }
 
     /// The core refuses to publish an empty relay list, so the last relay of a role cannot be
     /// unassigned — and the refusal has to happen here, not only in the disabled toggle.
     @MainActor
     @Test func turningOffARolesOnlyRelayIsRefused() async throws {
-        let (state, _) = await relayEditingState()
-        await state.setRelayRole(.inbox, isEnabled: false, forRelay: "wss://both.example")
-        let before = state.relaySettings
+        let (model, _) = await relayEditingModel()
+        await model.setRole(.inbox, isEnabled: false, forRelay: "wss://both.example")
+        let before = model.settings
 
-        await state.setRelayRole(.inbox, isEnabled: false, forRelay: "wss://inbox.example")
+        await model.setRole(.inbox, isEnabled: false, forRelay: "wss://inbox.example")
 
-        #expect(state.relaySettings == before)
-        #expect(state.lastError != nil)
-        #expect(state.relaySettings.isOnlyRelay("wss://inbox.example", for: .inbox))
-        #expect(state.relaySettings.rolesDependingOnly(on: "wss://inbox.example") == [.inbox])
+        #expect(model.settings == before)
+        #expect(model.error == .lastRelay(.inbox))
+        #expect(model.settings.isOnlyRelay("wss://inbox.example", for: .inbox))
+        #expect(model.settings.rolesDependingOnly(on: "wss://inbox.example") == [.inbox])
     }
 
     @MainActor
     @Test func removingARelayARoleDependsOnIsRefused() async throws {
-        let (state, _) = await relayEditingState()
-        let before = state.relaySettings
+        let (model, _) = await relayEditingModel()
+        let before = model.settings
 
-        await state.removeRelay("wss://profile.example")
-        #expect(state.relaySettings != before)
+        await model.removeRelay("wss://profile.example")
+        #expect(model.settings != before)
 
         // `wss://both.example` is now the only profile relay, so it cannot go.
-        let afterFirstRemoval = state.relaySettings
-        await state.removeRelay("wss://both.example")
-        #expect(state.relaySettings == afterFirstRemoval)
-        #expect(state.lastError != nil)
+        let afterFirstRemoval = model.settings
+        await model.removeRelay("wss://both.example")
+        #expect(model.settings == afterFirstRemoval)
+        #expect(model.error == .lastRelay(.profile))
     }
 
     @MainActor
     @Test func removeRelayDropsItFromEveryListItIsIn() async throws {
-        let (state, _) = await relayEditingState()
+        let (model, _) = await relayEditingModel()
 
-        await state.removeRelay("wss://both.example")
+        await model.removeRelay("wss://both.example")
 
-        #expect(state.relaySettings.nip65 == ["wss://profile.example"])
-        #expect(state.relaySettings.inbox == ["wss://inbox.example"])
-        #expect(!state.relayEndpoints.contains { $0.id == "wss://both.example" })
+        #expect(model.settings.nip65 == ["wss://profile.example"])
+        #expect(model.settings.inbox == ["wss://inbox.example"])
+        #expect(!model.endpoints.contains { $0.id == "wss://both.example" })
     }
 
     @MainActor
     @Test func restoreDefaultRelaysRewritesBothLists() async throws {
-        let (state, _) = await relayEditingState()
-        #expect(!state.relaySettings.isDefaultRelayConfiguration)
+        let (model, _) = await relayEditingModel()
+        #expect(!model.settings.isDefaultRelayConfiguration)
 
-        await state.restoreDefaultRelays()
+        await model.restoreDefaults()
 
-        #expect(state.relaySettings.nip65 == MarmotClient.seedRelays)
-        #expect(state.relaySettings.inbox == MarmotClient.seedRelays)
-        #expect(state.relaySettings.isDefaultRelayConfiguration)
+        #expect(model.settings.nip65 == MarmotClient.seedRelays)
+        #expect(model.settings.inbox == MarmotClient.seedRelays)
+        #expect(model.settings.isDefaultRelayConfiguration)
     }
 
     /// One union list, the prototype's overview: a relay in both lists is one row carrying both
     /// roles, not two rows.
     @MainActor
     @Test func relayEndpointsUnionBothListsWithoutDuplicating() async throws {
-        let (state, _) = await relayEditingState()
+        let (model, _) = await relayEditingModel()
 
-        let endpoints = state.relayEndpoints
+        let endpoints = model.endpoints
 
         #expect(endpoints.map(\.id) == ["wss://profile.example", "wss://both.example", "wss://inbox.example"])
         #expect(endpoints[0].roles == [.profile])
         #expect(endpoints[1].roles == [.profile, .inbox])
         #expect(endpoints[2].roles == [.inbox])
+    }
+
+    @MainActor
+    @Test func diagnosticLogExportPreservesTheOriginalJSONLBytes() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("diagnostic-log-export-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("audit.jsonl")
+        let original = Data("{\"event\":1}\n{\"event\":2}\n".utf8)
+        try original.write(to: url)
+
+        let runtime = FakeMarmotRuntime(accounts: [])
+        runtime.storedAuditLogFiles = [
+            AuditLogFileFfi(
+                accountRef: "account",
+                path: url.path,
+                fileName: url.lastPathComponent,
+                sizeBytes: UInt64(original.count),
+                modifiedAtMs: 2
+            )
+        ]
+        let model = DiagnosticsSettingsViewModel(runtime: runtime)
+
+        let snapshot = try await model.diagnosticLogExport()
+
+        #expect(snapshot.fileName == "audit.jsonl")
+        #expect(snapshot.data == original)
+    }
+
+    @Test func diagnosticLogExportRejectsAnIncompleteFinalJSONLRecord() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("diagnostic-log-incomplete-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("audit.jsonl")
+        let incomplete = Data("{\"event\":1}".utf8)
+        try incomplete.write(to: url)
+        let file = AuditLogFileFfi(
+            accountRef: "account",
+            path: url.path,
+            fileName: url.lastPathComponent,
+            sizeBytes: UInt64(incomplete.count),
+            modifiedAtMs: 1
+        )
+
+        #expect(throws: DiagnosticLogExport.ExportError.self) {
+            try DiagnosticLogExport.snapshot(file: file)
+        }
     }
 }

@@ -2,20 +2,6 @@ import Darwin
 import Foundation
 import MarmotKit
 
-enum TelemetrySettingsActionError: LocalizedError {
-    case telemetryNotConfigured
-    case auditLogNotConfigured
-
-    var errorDescription: String? {
-        switch self {
-        case .telemetryNotConfigured:
-            L10n.string("Telemetry credentials are not configured for this build.")
-        case .auditLogNotConfigured:
-            L10n.string("Audit log credentials are not configured for this build.")
-        }
-    }
-}
-
 struct TelemetryBuildConfig: Equatable {
     static let defaultOtlpEndpoint = "https://otlp.ipf.dev/v1/metrics"
     static let tenant = "whitenoise-mac"
@@ -27,6 +13,36 @@ struct TelemetryBuildConfig: Equatable {
     let serviceVersion: String
     let osVersion: String
     let deviceModelIdentifier: String?
+    let productAnalyticsEndpoint: String?
+    let productAnalyticsAppKey: String?
+    let productAnalyticsOperator: String
+    let productAnalyticsRetentionDisclosure: String?
+
+    init(
+        otlpEndpoint: String,
+        bearerToken: String?,
+        auditLogBearerToken: String?,
+        deploymentEnvironment: String,
+        serviceVersion: String,
+        osVersion: String,
+        deviceModelIdentifier: String?,
+        productAnalyticsEndpoint: String? = nil,
+        productAnalyticsAppKey: String? = nil,
+        productAnalyticsOperator: String = "white_noise",
+        productAnalyticsRetentionDisclosure: String? = nil
+    ) {
+        self.otlpEndpoint = otlpEndpoint
+        self.bearerToken = bearerToken
+        self.auditLogBearerToken = auditLogBearerToken
+        self.deploymentEnvironment = deploymentEnvironment
+        self.serviceVersion = serviceVersion
+        self.osVersion = osVersion
+        self.deviceModelIdentifier = deviceModelIdentifier
+        self.productAnalyticsEndpoint = productAnalyticsEndpoint
+        self.productAnalyticsAppKey = productAnalyticsAppKey
+        self.productAnalyticsOperator = productAnalyticsOperator
+        self.productAnalyticsRetentionDisclosure = productAnalyticsRetentionDisclosure
+    }
 
     var telemetryCredentialsAvailable: Bool {
         bearerToken != nil
@@ -81,7 +97,31 @@ struct TelemetryBuildConfig: Equatable {
             ),
             serviceVersion: serviceVersion(from: info),
             osVersion: osVersion,
-            deviceModelIdentifier: deviceModelIdentifier ?? Self.deviceModelIdentifier()
+            deviceModelIdentifier: deviceModelIdentifier ?? Self.deviceModelIdentifier(),
+            productAnalyticsEndpoint: stringValue(
+                for: "WhiteNoiseProductAnalyticsEndpoint",
+                in: info,
+                environmentKeys: ["WN_PRODUCT_ANALYTICS_ENDPOINT"],
+                environment: environment
+            ),
+            productAnalyticsAppKey: stringValue(
+                for: "WhiteNoiseProductAnalyticsAppKey",
+                in: info,
+                environmentKeys: ["WN_PRODUCT_ANALYTICS_APP_KEY"],
+                environment: environment
+            ),
+            productAnalyticsOperator: stringValue(
+                for: "WhiteNoiseProductAnalyticsOperator",
+                in: info,
+                environmentKeys: ["WN_PRODUCT_ANALYTICS_OPERATOR"],
+                environment: environment
+            ) ?? "white_noise",
+            productAnalyticsRetentionDisclosure: stringValue(
+                for: "WhiteNoiseProductAnalyticsRetention",
+                in: info,
+                environmentKeys: ["WN_PRODUCT_ANALYTICS_RETENTION"],
+                environment: environment
+            )
         )
     }
 
@@ -104,19 +144,46 @@ struct TelemetryBuildConfig: Equatable {
         )
     }
 
-    func auditTrackerConfig() -> AuditLogTrackerConfigFfi {
+    func auditTrackerConfig() -> AuditLogTrackerConfigV4Ffi {
         // Account identity now lives in the JSONL source_context emitted by the
         // Marmot core (Goggles contract), so the host no longer supplies an
         // account label here.
-        AuditLogTrackerConfigFfi(
+        AuditLogTrackerConfigV4Ffi(
             endpoint: nil,
             authorizationBearerToken: auditLogBearerToken,
-            source: AuditLogUploadSourceFfi(
-                deviceLabel: deviceModelIdentifier,
-                platform: "macOS",
+            source: AuditLogUploadSourceV4Ffi(
+                hardwareModel: deviceModelIdentifier,
+                platform: "macos",
                 appVersion: serviceVersion
             )
         )
+    }
+
+    func productAnalyticsRuntimeConfig() -> ProductAnalyticsRuntimeConfigFfi {
+        ProductAnalyticsRuntimeConfigFfi(
+            eventsEndpoint: productAnalyticsEndpoint,
+            appKey: productAnalyticsAppKey,
+            metadata: ProductAnalyticsMetadataFfi(
+                appVersion: serviceVersion,
+                osFamily: "macos",
+                osMajorVersion: osVersion.split(separator: ".").first.map(String.init) ?? "unknown",
+                deviceClass: "desktop",
+                hostSurface: "native",
+                environment: deploymentEnvironment,
+                isDebug: Self.isDebugBuild
+            ),
+            registry: ProductAnalyticsTimingStage.registry,
+            allowLoopback: false,
+            operator: productAnalyticsOperator
+        )
+    }
+
+    private static var isDebugBuild: Bool {
+        #if DEBUG
+            true
+        #else
+            false
+        #endif
     }
 
     nonisolated private static func stringValue(
@@ -189,5 +256,44 @@ struct TelemetryBuildConfig: Equatable {
         let identifier = String(cString: value)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return identifier.isEmpty ? nil : identifier
+    }
+}
+
+/// App-defined timings accepted by MarmotKit's consent-gated product event pipeline.
+/// The names match the iOS registry where the same screen projection is measured.
+enum ProductAnalyticsTimingStage: String, CaseIterable {
+    case timelineWindow = "app_timeline_window"
+    case timelineTail = "app_timeline_tail"
+    case timelineDelta = "app_timeline_delta"
+    case timelineRebuild = "app_timeline_rebuild"
+    case timelineProfiles = "app_timeline_profiles"
+    case outgoingProjection = "app_outgoing_projection"
+    case outgoingConfirmation = "app_outgoing_confirmation"
+    case sendDraftReady = "app_send_draft_ready"
+    case sendSubmission = "app_send_submission"
+    case sendProjection = "app_send_projection"
+    case markdownRebuild = "app_markdown_rebuild"
+    case mediaRebuild = "app_media_rebuild"
+    case inboxSnapshot = "app_inbox_snapshot"
+    case inboxBatch = "app_inbox_batch"
+    case inboxRefresh = "app_inbox_refresh"
+    case inboxPublish = "app_inbox_publish"
+    case composerMarkdown = "app_composer_markdown"
+
+    static var registry: [ProductEventSchemaFfi] {
+        allCases.map { stage in
+            ProductEventSchemaFfi(
+                name: stage.rawValue,
+                mode: .aggregate,
+                properties: [
+                    ProductPropertySchemaFfi(name: "elapsed", kind: .durationBucket, choices: []),
+                    ProductPropertySchemaFfi(
+                        name: "outcome",
+                        kind: .enum,
+                        choices: ["success", "failure"]
+                    ),
+                ]
+            )
+        }
     }
 }

@@ -324,6 +324,9 @@ private func groupSystemEvent(
     oldName: String? = nil
 ) -> GroupSystemEventFfi {
     GroupSystemEventFfi(
+        provenance: .authenticatedGroupState,
+        actorDisplayName: nil,
+        subjectDisplayName: nil,
         systemType: systemType,
         text: text,
         actorAccountIdHex: actorAccountIdHex,

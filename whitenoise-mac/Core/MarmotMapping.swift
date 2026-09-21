@@ -34,6 +34,45 @@ extension GroupMemberDetailsFfi {
     }
 }
 
+extension ConversationWindowSnapshotFfi {
+    /// Maps the bounded identity table carried by a complete conversation snapshot into the
+    /// renderer's value type. The only host-side overlay is the viewer's private nickname; no
+    /// profile, directory, or group-member lookup is allowed on this path.
+    func senderProfiles(
+        activeAccount: AccountItem,
+        nicknames: ContactNicknames,
+        avatarBytesByReference: [String: AvatarBytesFfi] = [:]
+    ) -> [String: ChatPeerProfile] {
+        identities.reduce(into: [String: ChatPeerProfile]()) { result, identity in
+            let publishedName = PeerDisplayText.sanitize(identity.displayName)
+            let nickname =
+                identity.accountIdHex == activeAccount.accountIdHex
+                ? nil : nicknames.nickname(forContactAccountIdHex: identity.accountIdHex)
+            let pictureURL: String?
+            switch identity.avatar {
+            case .remoteImage(let url, _):
+                pictureURL = url.nilIfBlank
+            case .encryptedGroupImage, .placeholder:
+                pictureURL = nil
+            }
+            result[identity.accountIdHex] = ChatPeerProfile(
+                accountIdHex: identity.accountIdHex,
+                displayName: nickname ?? publishedName,
+                publishedDisplayName: nickname == nil ? nil : publishedName,
+                pictureURL: pictureURL,
+                imagePayload: identity.avatarAsset?.reference.flatMap { reference in
+                    avatarBytesByReference[reference].flatMap { payload in
+                        guard payload.availability == .ready, !payload.deferred, !payload.bytes.isEmpty else {
+                            return nil
+                        }
+                        return DownloadedMediaPayload(id: reference, data: payload.bytes)
+                    }
+                }
+            )
+        }
+    }
+}
+
 extension ChatSelfMembership {
     nonisolated init(_ membership: SelfMembershipFfi) {
         switch membership {
@@ -176,7 +215,11 @@ extension ChatItem {
         senderNickname: String? = nil
     ) -> PreviewProjection {
         if preview.deleted {
-            return PreviewProjection(text: L10n.string("Message deleted"))
+            let text =
+                preview.deletionSource == .admin
+                ? MessageItem.deletionText(source: preview.deletionSource, isOutgoing: false)
+                : L10n.string("Message deleted")
+            return PreviewProjection(text: text)
         }
 
         let presentation = MessageItem.presentation(for: preview.kind)
@@ -308,6 +351,19 @@ extension ChatMessageDeliveryState {
     }
 }
 
+extension MessageDeletionSource {
+    nonisolated init(_ source: DeletionSourceFfi) {
+        switch source {
+        case .unknown:
+            self = .unknown
+        case .author:
+            self = .author
+        case .admin:
+            self = .admin
+        }
+    }
+}
+
 nonisolated enum MessageEditMutation: Equatable, Sendable {
     case upsert(MessageEditOverlay)
     case retract(editMessageIdHex: String)
@@ -387,6 +443,10 @@ nonisolated extension MessageItem {
         let senderProfile = senderProfiles[record.sender]
         let presentation = MessageItem.presentation(for: record.kind)
         let plaintext = editedPlaintext ?? record.plaintext
+        let projectedIsEdited = isEdited || record.edit != nil
+        let isOutgoing =
+            presentation.isChatBubble
+            && (record.sender == activeAccountIdHex || record.direction.lowercased() == "outbound")
         let mediaAttachments = MessageMediaParser.attachments(
             resolvedMedia: record.media,
             mediaJson: record.mediaJson,
@@ -404,6 +464,8 @@ nonisolated extension MessageItem {
                 plaintext: plaintext,
                 tags: record.tags,
                 deleted: record.deleted,
+                deletionSource: record.deletionSource,
+                isOutgoing: isOutgoing,
                 hasMediaAttachments: !mediaAttachments.isEmpty
             )
 
@@ -427,8 +489,9 @@ nonisolated extension MessageItem {
                 presentation: presentation
             ),
             senderPictureURL: senderProfile?.pictureURL,
+            senderImagePayload: senderProfile?.imagePayload,
             body: body,
-            contentMarkdown: isEdited
+            contentMarkdown: projectedIsEdited
                 ? nil
                 : MessageItem.renderableMarkdown(
                     document: record.contentTokens,
@@ -441,10 +504,12 @@ nonisolated extension MessageItem {
             timelineAt: record.timelineAt,
             timelineKind: record.kind,
             isDeleted: record.deleted,
+            deletionSource: MessageDeletionSource(record.deletionSource),
+            hasReports: record.hasReports,
             invalidationStatus: record.invalidationStatus,
-            isEdited: isEdited,
-            isOutgoing: presentation.isChatBubble
-                && (record.sender == activeAccountIdHex || record.direction.lowercased() == "outbound"),
+            isEdited: projectedIsEdited,
+            editCount: record.edit?.editCount ?? (isEdited ? 1 : 0),
+            isOutgoing: isOutgoing,
             reactions: presentation.isChatBubble ? reactions : [],
             replyContext: presentation.isChatBubble ? replyContext : nil,
             mediaAttachments: presentation.isChatBubble ? mediaAttachments : [],
@@ -975,10 +1040,12 @@ nonisolated extension MessageItem {
         plaintext: String,
         tags: [MessageTagFfi],
         deleted: Bool,
+        deletionSource: DeletionSourceFfi = .unknown,
+        isOutgoing: Bool = false,
         hasMediaAttachments: Bool = false
     ) -> String {
         if deleted {
-            return L10n.string("Message deleted")
+            return deletionText(source: deletionSource, isOutgoing: isOutgoing)
         }
 
         let body = plaintext.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1051,6 +1118,7 @@ nonisolated extension MessageItem {
             plaintext: preview.plaintext,
             tags: [],
             deleted: preview.deleted,
+            deletionSource: preview.deletionSource,
             hasMediaAttachments: !mediaAttachments.isEmpty
         )
         return MessageReplyContext(
@@ -1058,6 +1126,17 @@ nonisolated extension MessageItem {
             senderName: MessageItem.displayName(for: preview.sender, profile: senderProfiles[preview.sender]),
             body: body.isEmpty ? MessageMediaAttachment.previewText(for: mediaAttachments) : body
         )
+    }
+
+    fileprivate static func deletionText(source: DeletionSourceFfi, isOutgoing: Bool) -> String {
+        switch source {
+        case .admin:
+            return L10n.string("This message was deleted by an admin.")
+        case .author where isOutgoing:
+            return L10n.string("You deleted this message.")
+        case .author, .unknown:
+            return L10n.string("This message was deleted")
+        }
     }
 
     private static func senderName(
@@ -1175,7 +1254,7 @@ private nonisolated enum UntrustedJSON {
     }
 }
 
-private nonisolated enum MessageMediaParser {
+nonisolated enum MessageMediaParser {
     // Legacy inbound fallback parsing intentionally mirrors the compose cap for now,
     // but keeps its own policy name so it can diverge from outgoing media limits.
     private static let maxFallbackAttachmentsPerMessage =
@@ -1189,7 +1268,7 @@ private nonisolated enum MessageMediaParser {
     private static let logger = Logger(subsystem: "com.whitenoise.media", category: "MessageMediaParser")
 
     static func attachments(
-        resolvedMedia: [MediaAttachmentReferenceFfi],
+        resolvedMedia: [MediaAttachmentOutcomeFfi],
         mediaJson: String?,
         tags: [MessageTagFfi],
         messageIdHex: String
@@ -1199,21 +1278,36 @@ private nonisolated enum MessageMediaParser {
         // `list_media`, with malformed `imeta` attachments already dropped. Fall
         // back to local parsing only for records that predate FFI media resolution
         // (e.g. an empty `media` list paired with a populated `mediaJson`).
-        let resolvedReferences: [MediaAttachmentReferenceFfi]
         if !resolvedMedia.isEmpty {
-            resolvedReferences = resolvedMedia
-        } else {
-            let tagReferences = references(fromIMetaTags: tags)
-            let jsonReferences = references(fromMediaJson: mediaJson)
-            let fallbackReferences =
-                jsonReferences.references.isEmpty ? tagReferences : jsonReferences
-            if fallbackReferences.wasTruncated {
-                logFallbackOverflow()
+            return resolvedMedia.map { outcome in
+                switch outcome {
+                case .accepted(let attachmentIndex, let reference):
+                    return MessageMediaAttachment(
+                        id: mediaAttachmentId(
+                            messageIdHex: messageIdHex,
+                            reference: reference,
+                            index: Int(attachmentIndex)
+                        ),
+                        reference: reference
+                    )
+                case .rejected(let attachmentIndex, let rejection):
+                    return MessageMediaAttachment.rejected(
+                        id: "\(messageIdHex)#\(attachmentIndex)#rejected",
+                        kind: rejection.kind
+                    )
+                }
             }
-            resolvedReferences = fallbackReferences.references
         }
 
-        return resolvedReferences.enumerated().map { index, reference in
+        let tagReferences = references(fromIMetaTags: tags)
+        let jsonReferences = references(fromMediaJson: mediaJson)
+        let fallbackReferences =
+            jsonReferences.references.isEmpty ? tagReferences : jsonReferences
+        if fallbackReferences.wasTruncated {
+            logFallbackOverflow()
+        }
+
+        return fallbackReferences.references.enumerated().map { index, reference in
             MessageMediaAttachment(
                 id: mediaAttachmentId(messageIdHex: messageIdHex, reference: reference, index: index),
                 reference: reference

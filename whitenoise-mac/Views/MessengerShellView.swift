@@ -10,6 +10,19 @@ import UniformTypeIdentifiers
 
 struct MessengerShellView: View {
     @Environment(WorkspaceState.self) private var workspace
+    @Environment(SessionState.self) private var session
+
+    private var productScreen: ProductScreen? {
+        guard workspace.phase == .ready, workspace.activeAccount != nil else { return nil }
+        switch workspace.selection {
+        case .settings:
+            return .settings
+        case .chat:
+            return workspace.selectedChat == nil ? .inbox : .conversation
+        case nil:
+            return .inbox
+        }
+    }
 
     var body: some View {
         let ignoredEdges: Edge.Set = workspace.showsMessengerChrome ? .top : []
@@ -33,7 +46,7 @@ struct MessengerShellView: View {
 
                         Group {
                             if workspace.isChatListVisible {
-                                ChatListDrawerView()
+                                ChatListDrawerView(model: session.accountScope?.chatListModel)
                                     // Deliberately un-animated: the width is dragged, so animating
                                     // it would re-wrap the non-lazy transcript on every frame of the
                                     // drag *and* again through the collapse snap — the same layout
@@ -87,11 +100,16 @@ struct MessengerShellView: View {
             MediaDownloadFeedbackToast()
         }
         .ignoresSafeArea(.container, edges: ignoredEdges)
+        .task(id: productScreen) {
+            guard let productScreen else { return }
+            session.accountScope?.productAnalytics.record(.screen(productScreen))
+        }
     }
 }
 
 private struct DetailPaneView: View {
     @Environment(WorkspaceState.self) private var workspace
+    @Environment(SessionState.self) private var session
 
     var body: some View {
         Group {
@@ -99,7 +117,7 @@ private struct DetailPaneView: View {
             case .bootstrapping:
                 StartupView()
             case .onboarding:
-                OnboardingView()
+                OnboardingView(model: session.accountScope?.onboarding)
             case .failed(let message):
                 FailureView(message: message)
             case .ready:
@@ -116,22 +134,46 @@ private struct DetailPaneView: View {
                     // `signOutAccount`, `removeAccount` — all move to `.onboarding` themselves,
                     // so this branch should be unreachable. It renders the same surface as that
                     // phase rather than a blank pane if one is ever missed.
-                    OnboardingView()
+                    OnboardingView(model: session.accountScope?.onboarding)
                 } else {
                     switch workspace.selection {
                     case .chat:
-                        if let chat = workspace.selectedChat {
-                            ConversationView(chat: chat)
+                        if let chat = workspace.selectedChat,
+                            let model = session.accountScope?.selectedConversationModel,
+                            model.groupIdHex == chat.id,
+                            let scope = session.accountScope
+                        {
+                            ConversationView(
+                                chat: chat,
+                                model: model,
+                                chatListModel: scope.chatListModel,
+                                attachmentModel: scope.attachmentModel(groupIdHex: chat.id),
+                                safetyModel: scope.safetyModel(groupIdHex: chat.id),
+                                blockedUsersModel: scope.blockedUsers
+                            )
                         } else {
                             EmptyDetailView()
                         }
                     case .settings:
-                        SettingsPanelView()
+                        if let model = session.accountScope?.settingsModel {
+                            SettingsPanelView(model: model)
+                        } else {
+                            EmptyDetailView()
+                        }
                     case nil:
                         EmptyDetailView()
                     }
                 }
             }
+        }
+        .task(id: session.accountScope?.onboarding.snapshot?.revision) {
+            guard workspace.phase == .onboarding,
+                session.accountScope?.onboarding.isDurablyReady == true,
+                workspace.activeAccount != nil
+            else { return }
+            let enteredAccountIdHex = workspace.activeAccount?.accountIdHex
+            await workspace.activateReadyState()
+            workspace.presentImprovementsPromptIfNeeded(forEnteredAccountIdHex: enteredAccountIdHex)
         }
     }
 }
@@ -223,7 +265,22 @@ private struct ConversationView: View {
     /// restored the moment scrolling settles.
     @State private var isActivelyScrolling = false
     let chat: ChatItem
+    let model: ConversationViewModel
+    let chatListModel: ChatListViewModel
+    let attachmentModel: AttachmentViewModel
+    let safetyModel: GroupSafetyViewModel
+    let blockedUsersModel: BlockedUsersViewModel
     private let bottomTranscriptPadding: CGFloat = 34
+
+    private var isBlockedDirectPeer: Bool {
+        chat.directPeerAccountIdHex.map {
+            blockedUsersModel.isBlocked(accountID: $0)
+        } ?? false
+    }
+
+    private var canUseComposer: Bool {
+        chat.canUseComposer && !isBlockedDirectPeer
+    }
 
     var body: some View {
         @Bindable var workspace = workspace
@@ -237,7 +294,7 @@ private struct ConversationView: View {
             VStack(spacing: 0) {
                 ConversationHeader(chat: chat)
                     .messageDeletionConfirmation()
-                    .messageEditHistory()
+                    .messageEditHistory(model: model)
                 GlassSeparator(axis: .horizontal)
 
                 ScrollViewReader { proxy in
@@ -271,6 +328,7 @@ private struct ConversationView: View {
 
                                     ConversationMessageRow(
                                         message: item.message,
+                                        safetyModel: safetyModel,
                                         showsDebugMetadata: workspace.streamingDebugEnabled,
                                         timestampReferenceDate: timestampReferenceDate,
                                         timestampLocale: locale
@@ -493,6 +551,8 @@ private struct ConversationView: View {
                         MessageSelectionToolbar()
                     } else if chat.isNoLongerMember {
                         MembershipEndedComposerNotice(membership: chat.selfMembership)
+                    } else if isBlockedDirectPeer {
+                        BlockedConversationComposerNotice()
                     } else if chat.pendingConfirmation {
                         PendingGroupInviteComposerNotice(chat: chat)
                     } else {
@@ -535,11 +595,11 @@ private struct ConversationView: View {
                 // accumulate invisibly behind the replacement notice and could never be
                 // sent. `addMediaAttachments` re-checks via
                 // `canBeginMediaAttachmentSelection()` as defense in depth.
-                guard chat.canUseComposer else { return false }
+                guard canUseComposer else { return false }
                 Task { await workspace.addMediaAttachments(from: urls) }
                 return !urls.isEmpty
             } isTargeted: { isTargeted in
-                isFileDropTargeted = isTargeted && chat.canUseComposer
+                isFileDropTargeted = isTargeted && canUseComposer
             }
             .overlay {
                 if isFileDropTargeted {
@@ -555,13 +615,18 @@ private struct ConversationView: View {
             // scroll position, while the details pane supplies its own opaque base so
             // chat content and media never visually bleed through during the slide.
             if workspace.isGroupDetailsPresented {
-                GroupDetailsPane(chat: chat)
-                    .transition(.move(edge: .trailing))
-                    .zIndex(3)
+                GroupDetailsPane(
+                    chat: chat,
+                    conversationModel: model,
+                    attachmentModel: attachmentModel,
+                    safetyModel: safetyModel
+                )
+                .transition(.move(edge: .trailing))
+                .zIndex(3)
             }
 
             if let contact = workspace.contactDetailsTarget {
-                ContactDetailsPane(contact: contact)
+                ContactDetailsPane(contact: contact, blockedUsersModel: blockedUsersModel)
                     .transition(.move(edge: .trailing))
                     .zIndex(4)
             }
@@ -587,7 +652,7 @@ private struct ConversationView: View {
                 }
             )
         ) {
-            MessageForwardSheet()
+            MessageForwardSheet(chatListModel: chatListModel)
         }
         // Switching conversations must not leave the previous chat's body-level
         // overlays open over a different transcript.
@@ -802,17 +867,8 @@ private struct ConversationView: View {
     }
 
     private func revealMessage(_ messageId: String, using proxy: ScrollViewProxy) async {
-        var attempts = 0
-        while !workspace.selectedTimelineContainsMessage(messageId),
-            workspace.selectedTimelinePaging.hasMoreBefore,
-            attempts < 12
-        {
-            let previousFirstId = workspace.selectedMessageIDs.first
-            await workspace.loadOlderMessages(groupIdHex: chat.id)
-            attempts += 1
-            guard workspace.selectedChat?.id == chat.id,
-                workspace.selectedMessageIDs.first != previousFirstId
-            else { break }
+        if !workspace.selectedTimelineContainsMessage(messageId) {
+            await model.jump(to: messageId)
         }
         guard workspace.selectedChat?.id == chat.id,
             workspace.selectedTimelineContainsMessage(messageId)
@@ -823,14 +879,8 @@ private struct ConversationView: View {
     }
 
     private func jumpToNewest(using proxy: ScrollViewProxy) async {
-        var attempts = 0
-        while workspace.selectedTimelinePaging.hasMoreAfter, attempts < 12 {
-            let previousLastID = workspace.selectedMessageIDs.last
-            await workspace.loadNewerMessages(groupIdHex: chat.id)
-            attempts += 1
-            guard workspace.selectedChat?.id == chat.id,
-                workspace.selectedMessageIDs.last != previousLastID
-            else { break }
+        if workspace.selectedTimelinePaging.hasMoreAfter {
+            await model.returnToLatest()
         }
         guard workspace.selectedChat?.id == chat.id else { return }
         scrollToBottom(with: proxy)
@@ -844,7 +894,7 @@ private struct ConversationView: View {
     /// action fires asynchronously after body evaluation.
     private func loadOlderIfNeeded() {
         let paging = workspace.selectedTimelinePaging
-        guard paging.hasMoreBefore, !paging.isLoadingBefore,
+        guard paging.hasMoreBefore, !model.isPaging,
             pendingPrependAnchorId == nil,
             let anchorId = workspace.selectedMessageIDs.first
         else { return }
@@ -853,7 +903,7 @@ private struct ConversationView: View {
         // began — the head of the scroll-back cycle that ends at `restorePrependAnchor`.
         TimelineSignpost.scroll.emitEvent("loadOlderTriggered")
         Task {
-            await workspace.loadOlderMessages(groupIdHex: chat.id)
+            await model.page(.older)
             // Fallback clear when no restoration occurs (e.g. already at the oldest message,
             // so `messageIDs.first` never changes and the `.first` onChange won't fire).
             if pendingPrependAnchorId == anchorId, workspace.selectedMessageIDs.first == anchorId {
@@ -866,14 +916,14 @@ private struct ConversationView: View {
     /// from the live edge (`hasMoreAfter`) and the user scrolls near the bottom.
     private func loadNewerIfNeeded() {
         let paging = workspace.selectedTimelinePaging
-        guard paging.hasMoreAfter, !paging.isLoadingAfter,
+        guard paging.hasMoreAfter, !model.isPaging,
             pendingAppendAnchorId == nil,
             let anchorId = workspace.selectedMessageIDs.last
         else { return }
         pendingAppendAnchorId = anchorId
         TimelineSignpost.scroll.emitEvent("loadNewerTriggered")
         Task {
-            await workspace.loadNewerMessages(groupIdHex: chat.id)
+            await model.page(.newer)
             if pendingAppendAnchorId == anchorId, workspace.selectedMessageIDs.last == anchorId {
                 pendingAppendAnchorId = nil
             }
@@ -920,24 +970,33 @@ private struct StartupView: View {
 
 private struct GroupDetailsPane: View {
     let chat: ChatItem
+    let conversationModel: ConversationViewModel
+    let attachmentModel: AttachmentViewModel
+    let safetyModel: GroupSafetyViewModel
 
     var body: some View {
-        GroupDetailsSheet(chat: chat)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background {
-                MessagesTranscriptBackground()
-            }
-            .clipped()
-            .contentShape(Rectangle())
-            .accessibilityIdentifier("group.details.pane")
+        GroupDetailsSheet(
+            chat: chat,
+            conversationModel: conversationModel,
+            attachmentModel: attachmentModel,
+            safetyModel: safetyModel
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            MessagesTranscriptBackground()
+        }
+        .clipped()
+        .contentShape(Rectangle())
+        .accessibilityIdentifier("group.details.pane")
     }
 }
 
 private struct ContactDetailsPane: View {
     let contact: NewChatRecipient
+    let blockedUsersModel: BlockedUsersViewModel
 
     var body: some View {
-        ContactDetailsView(contact: contact)
+        ContactDetailsView(contact: contact, blockedUsersModel: blockedUsersModel)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background {
                 MessagesTranscriptBackground()

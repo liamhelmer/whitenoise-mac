@@ -31,7 +31,7 @@
 import SwiftUI
 
 struct RelaySettingsView: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: RelaySettingsViewModel
     /// The relay whose detail is open, as `RelayEndpointItem.id`. Held as an id rather than as
     /// the item so the detail always re-reads the live snapshot after a role change, and falls
     /// back to the list when the relay it was showing is gone.
@@ -39,31 +39,34 @@ struct RelaySettingsView: View {
 
     private var openRelay: RelayEndpointItem? {
         guard let openRelayID else { return nil }
-        return workspace.relayEndpoints.first { $0.id == openRelayID }
+        return model.endpoints.first { $0.id == openRelayID }
     }
 
     var body: some View {
-        if let openRelay {
-            RelayDetailSettingsView(relay: openRelay) {
-                openRelayID = nil
-            }
-        } else {
-            RelayListSettingsView { relay in
-                openRelayID = relay.id
+        Group {
+            if let openRelay {
+                RelayDetailSettingsView(model: model, relay: openRelay) {
+                    openRelayID = nil
+                }
+            } else {
+                RelayListSettingsView(model: model) { relay in
+                    openRelayID = relay.id
+                }
             }
         }
+        .task { await model.load() }
     }
 }
 
 /// The overview: what needs attention, every endpoint, and the two set-level actions.
 struct RelayListSettingsView: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: RelaySettingsViewModel
     @State private var isAddRelayPresented = false
     @State private var isRestoreDefaultsPresented = false
     let openRelay: (RelayEndpointItem) -> Void
 
     private var endpoints: [RelayEndpointItem] {
-        workspace.relayEndpoints
+        model.endpoints
     }
 
     var body: some View {
@@ -71,9 +74,9 @@ struct RelayListSettingsView: View {
             title: L10n.string("Relays"),
             subtitle: L10n.string("Manage the relay lists published for this account.")
         ) {
-            if workspace.relaySettings.relaysNeedAttention {
+            if model.settings.relaysNeedAttention {
                 SettingsSection {
-                    RelayAttentionRow(summary: workspace.relaySettings.relayAttentionSummary)
+                    RelayAttentionRow(summary: model.settings.relayAttentionSummary)
                 }
             }
 
@@ -98,7 +101,7 @@ struct RelayListSettingsView: View {
                 } label: {
                     Label(L10n.string("Add relay"), systemImage: "plus.circle")
                 }
-                .disabled(workspace.isSavingRelays || workspace.activeAccount == nil)
+                .disabled(model.isSaving)
             }
 
             SettingsSection(footer: L10n.string("Restores the relays a new account starts on.")) {
@@ -108,12 +111,10 @@ struct RelayListSettingsView: View {
                     Text(L10n.string("Restore default relays"))
                 }
                 .disabled(
-                    workspace.isSavingRelays
-                        || workspace.activeAccount == nil
-                        || workspace.relaySettings.isDefaultRelayConfiguration
+                    model.isSaving || model.settings.isDefaultRelayConfiguration
                 )
 
-                if workspace.isSavingRelays {
+                if model.isSaving {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
@@ -123,9 +124,13 @@ struct RelayListSettingsView: View {
                     }
                 }
             }
+
+            if let error = model.error?.message {
+                SettingsErrorView(error: error)
+            }
         }
         .sheet(isPresented: $isAddRelayPresented) {
-            AddRelaySheet()
+            AddRelaySheet(model: model)
         }
         .confirmationDialog(
             L10n.string("Restore default relays?"),
@@ -133,7 +138,7 @@ struct RelayListSettingsView: View {
             titleVisibility: .visible
         ) {
             Button(L10n.string("Restore defaults"), role: .destructive) {
-                Task { await workspace.restoreDefaultRelays() }
+                Task { await model.restoreDefaults() }
             }
             Button(L10n.string("Cancel"), role: .cancel) {}
         } message: {
@@ -145,6 +150,13 @@ struct RelayListSettingsView: View {
             )
         }
     }
+}
+
+#Preview {
+    RelaySettingsView(
+        model: RelaySettingsViewModel(accountRef: "preview", runtime: nil)
+    )
+    .frame(width: 760, height: 640)
 }
 
 /// The orange notice above the list when a role has no usable relay.

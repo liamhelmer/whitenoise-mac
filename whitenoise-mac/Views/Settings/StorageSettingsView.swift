@@ -6,11 +6,16 @@
 //  get the space back.
 //
 
+import MarmotKit
 import SwiftUI
 
 struct StorageSettingsView: View {
     @Environment(WorkspaceState.self) private var workspace
     @State private var showClearConfirmation = false
+    @State private var retainedMiB = 2_048
+    @State private var reserveMiB = 256
+    @State private var transferMiB = 64
+    let model: StorageSettingsViewModel
 
     var body: some View {
         SettingsScaffold(
@@ -31,6 +36,55 @@ struct StorageSettingsView: View {
                     workspace.changeMediaDownloadDestination()
                 }
                 .buttonStyle(.wnSecondary)
+            }
+
+            SettingsSection(
+                title: L10n.string("Storage"),
+                footer: L10n.string(
+                    "Limits apply to this profile. Downloads pause when storage is full; existing files are kept. Remove individual downloads from Message info. Automatic downloads also follow your media and network preferences."
+                )
+            ) {
+                if model.policy == nil {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Stepper(value: $retainedMiB, in: max(256, transferMiB)...32_768, step: 256) {
+                        LabeledContent(
+                            L10n.string("Download storage limit"),
+                            value: mebibyteCount(retainedMiB)
+                        )
+                    }
+
+                    Stepper(value: $reserveMiB, in: 0...8_192, step: 256) {
+                        LabeledContent(
+                            L10n.string("Keep disk space free"),
+                            value: mebibyteCount(reserveMiB)
+                        )
+                    }
+
+                    Stepper(value: $transferMiB, in: 1...min(512, retainedMiB), step: 1) {
+                        LabeledContent(
+                            L10n.string("Automatic download size limit"),
+                            value: mebibyteCount(transferMiB)
+                        )
+                    }
+
+                    Button(L10n.string("Save")) {
+                        Task {
+                            await model.saveLimits(
+                                retainedBytes: bytes(fromMebibytes: retainedMiB),
+                                diskReserve: bytes(fromMebibytes: reserveMiB),
+                                transferLimit: bytes(fromMebibytes: transferMiB)
+                            )
+                        }
+                    }
+                    .nativeGlassProminentButtonStyle()
+                    .disabled(model.isSaving)
+
+                    if let error = model.error {
+                        SettingsStatusNote(text: error.message, intention: .failure)
+                    }
+                }
             }
 
             SettingsSection(
@@ -87,6 +141,14 @@ struct StorageSettingsView: View {
         .task {
             workspace.refreshMediaDownloadDestinationPath()
             await workspace.refreshMediaCacheFootprint()
+            await model.load()
+        }
+        .task(id: model.policy) {
+            guard let policy = model.policy else { return }
+            retainedMiB = min(32_768, max(256, Int(policy.retainedBytes / 1_048_576)))
+            reserveMiB = min(8_192, max(0, Int(policy.diskReserve / 1_048_576)))
+            transferMiB = min(512, max(1, Int(policy.transferLimit / 1_048_576)))
+            retainedMiB = max(retainedMiB, transferMiB)
         }
         .confirmationDialog(
             L10n.string("Clear media cache?"),
@@ -112,4 +174,21 @@ struct StorageSettingsView: View {
     private func byteCount(_ bytes: UInt64) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
     }
+
+    private func mebibyteCount(_ mebibytes: Int) -> String {
+        ByteCountFormatter.string(
+            fromByteCount: Int64(mebibytes) * 1_048_576,
+            countStyle: .binary
+        )
+    }
+
+    private func bytes(fromMebibytes mebibytes: Int) -> UInt64 {
+        UInt64(mebibytes) * 1_048_576
+    }
+}
+
+#Preview {
+    StorageSettingsView(model: .preview())
+        .environment(WorkspaceState.preview())
+        .frame(width: 760, height: 720)
 }

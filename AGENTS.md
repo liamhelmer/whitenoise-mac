@@ -142,18 +142,27 @@ build.
   generated UniFFI Swift bindings are tracked next to it. **No mdk checkout is
   needed to build**, and nothing binary is committed.
 - To move to another core release: `just sync-bindings <version-or-full-sha>`.
-  The script verifies the binary checksum, the generated Swift source hash, and
-  the manifest's `source_sha` before installing anything, then rewrites the pin
-  and stamps `Vendored/MarmotKit/MARMOT_VERSION`. `just sanity` cross-checks
-  that the pin and the stamp still agree, and re-hashes the vendored
-  `MarmotKit.swift` against the stamp — so never hand-edit the generated
-  source, re-run the sync instead.
+  The script verifies the binary checksum, generated Swift source hash,
+  separately checksummed privacy manifest, and the release manifest's
+  `source_sha` and distribution metadata before installing anything, then
+  rewrites the pin and stamps `Vendored/MarmotKit/MARMOT_VERSION`. `just sanity`
+  cross-checks every stamp, re-hashes the vendored `MarmotKit.swift` and
+  `PrivacyInfo.xcprivacy`, and verifies the Swift package resource declaration
+  — so never hand-edit generated release artifacts, re-run the sync instead.
 - The published macOS XCFramework is `aarch64-apple-darwin` only — there is no
   Intel or universal build upstream, so the app stays arm64-only.
 - `MarmotRuntime` (in `Core/MarmotClient.swift`) is the `nonisolated` protocol the
   app calls; the concrete `MarmotClient` forwards thinly to the generated `Marmot`
   object, and `FakeMarmotRuntime` in the tests mirrors it. **Adding an FFI method
   means updating all three.**
+- Projection subscriptions are owned below `Session/AccountScope.swift` and use
+  cancellation-aware `nextCancellable()` bridges. Prepared chat rows, account
+  attention, conversation windows, transfer snapshots, block lists, and
+  onboarding snapshots are complete replacements; do not merge them with an
+  older snapshot or restart per-row enrichment.
+- MarmotKit 0.10.4 upgrades account databases through migrations 57–89. An older
+  0.9.x app must not reopen an upgraded database; see
+  `docs/MarmotKit-0.10.4-migration.md`.
 - FFI value records crossing the off-main boundary (`WorkspaceState.runOffMain`)
   no longer need app-side `Sendable` conformances: since UniFFI 0.29 the
   generated module declares (checked) `Sendable` on them itself, which is why

@@ -76,12 +76,19 @@ extension WorkspaceState {
             guard let account = accounts.first(where: { $0.id == key.accountId }) else { continue }
             let snapshot = composerDraftPersistenceSnapshot(for: key)
             do {
+                let selected = try client.selectedMessageDraft(
+                    accountRef: account.accountRef,
+                    groupIdHex: key.chatId
+                )
                 if snapshot.isEmpty {
-                    try client.deleteMessageDraft(accountRef: account.accountRef, groupIdHex: key.chatId)
-                } else {
-                    _ = try client.saveMessageDraft(
+                    _ = try client.clearMessageDraftIfRevision(
                         accountRef: account.accountRef,
-                        groupIdHex: key.chatId,
+                        revision: selected.revision
+                    )
+                } else {
+                    _ = try client.saveMessageDraftIfRevision(
+                        accountRef: account.accountRef,
+                        revision: selected.revision,
                         content: snapshot.content,
                         replyToMessageIdHex: snapshot.replyToMessageIdHex,
                         mediaAttachments: snapshot.mediaAttachments
@@ -112,9 +119,35 @@ extension WorkspaceState {
         let startingGeneration = composerDraftMutationGenerations[key] ?? 0
         restoredComposerDraftKeys.insert(key)
         do {
-            let storedDraft = try await FFIExecutor.run {
-                try client.messageDraft(accountRef: account.accountRef, groupIdHex: groupIdHex)
+            let selectedDraft = try await FFIExecutor.run {
+                let selected = try client.selectedMessageDraft(
+                    accountRef: account.accountRef,
+                    groupIdHex: groupIdHex
+                )
+                let attachments = try selected.draft?.mediaAttachments.map { attachment in
+                    guard
+                        let plaintext = try client.messageDraftAttachmentIfRevision(
+                            accountRef: account.accountRef,
+                            revision: selected.revision,
+                            attachmentId: attachment.id
+                        )
+                    else {
+                        throw MarmotKitError.MessageDraftRevisionConflict
+                    }
+                    return MessageDraftAttachmentFfi(
+                        id: attachment.id,
+                        fileName: attachment.fileName,
+                        mediaType: attachment.mediaType,
+                        plaintext: plaintext,
+                        dim: attachment.dim,
+                        thumbhash: attachment.thumbhash,
+                        durationSeconds: attachment.durationSeconds,
+                        waveformSamples: attachment.waveformSamples
+                    )
+                }
+                return (selected, attachments ?? [])
             }
+            let storedDraft = selectedDraft.0.draft
 
             let mentionNames: MarkdownMentionNames
             if storedDraft?.content.contains("@npub1") == true,
@@ -167,7 +200,7 @@ extension WorkspaceState {
             // draft. If the stored draft also holds text or other files — a draft written before
             // recordings took the composer over on their own — it comes back as ordinary media,
             // so nothing the user typed ends up hidden behind the voice bar.
-            let storedAttachments = storedDraft.mediaAttachments
+            let storedAttachments = selectedDraft.1
                 .prefix(OutgoingMediaDraftProcessor.maxAttachmentCount)
             let restoresAsVoiceMessage = presentation.text.isEmpty && storedAttachments.count == 1
             let attachments = storedAttachments.map { attachment in
@@ -226,7 +259,14 @@ extension WorkspaceState {
         restoredComposerDraftKeys.insert(key)
         do {
             try await FFIExecutor.run {
-                try client.deleteMessageDraft(accountRef: accountRef, groupIdHex: key.chatId)
+                let selected = try client.selectedMessageDraft(
+                    accountRef: accountRef,
+                    groupIdHex: key.chatId
+                )
+                _ = try client.clearMessageDraftIfRevision(
+                    accountRef: accountRef,
+                    revision: selected.revision
+                )
             }
             guard composerDraftMutationGenerations[key] == generation else { return }
             dirtyComposerDraftKeys.remove(key)
@@ -284,15 +324,20 @@ extension WorkspaceState {
 
         let snapshot = composerDraftPersistenceSnapshot(for: key)
         do {
-            if snapshot.isEmpty {
-                try await FFIExecutor.run {
-                    try client.deleteMessageDraft(accountRef: account.accountRef, groupIdHex: key.chatId)
-                }
-            } else {
-                _ = try await FFIExecutor.run {
-                    try client.saveMessageDraft(
+            try await FFIExecutor.run {
+                let selected = try client.selectedMessageDraft(
+                    accountRef: account.accountRef,
+                    groupIdHex: key.chatId
+                )
+                if snapshot.isEmpty {
+                    _ = try client.clearMessageDraftIfRevision(
                         accountRef: account.accountRef,
-                        groupIdHex: key.chatId,
+                        revision: selected.revision
+                    )
+                } else {
+                    _ = try client.saveMessageDraftIfRevision(
+                        accountRef: account.accountRef,
+                        revision: selected.revision,
                         content: snapshot.content,
                         replyToMessageIdHex: snapshot.replyToMessageIdHex,
                         mediaAttachments: snapshot.mediaAttachments
@@ -342,7 +387,7 @@ extension WorkspaceState {
         )
     }
 
-    private nonisolated static func messageDraftAttachment(
+    nonisolated static func messageDraftAttachment(
         from attachment: PendingMediaAttachment
     ) -> MessageDraftAttachmentFfi {
         MessageDraftAttachmentFfi(

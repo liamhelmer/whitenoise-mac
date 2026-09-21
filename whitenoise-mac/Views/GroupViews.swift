@@ -8,6 +8,7 @@
 //
 
 import AppKit
+import MarmotKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -30,6 +31,13 @@ struct GroupDetailsSheet: View {
     @State private var customDurationText = "1"
     @State private var customDurationUnit = DisappearingMessageDurationUnit.days
     let chat: ChatItem
+    let conversationModel: ConversationViewModel
+    let attachmentModel: AttachmentViewModel
+    let safetyModel: GroupSafetyViewModel
+
+    private var canModerate: Bool {
+        !chat.isDirect && conversationModel.snapshot?.header.capabilities.isSelfAdmin == true
+    }
 
     private var hasProfileChanges: Bool {
         guard let snapshot = workspace.groupDetailsSnapshot else { return false }
@@ -190,6 +198,13 @@ struct GroupDetailsSheet: View {
 
             if let snapshot = workspace.groupDetailsSnapshot {
                 Form {
+                    GroupRecoverySection(model: safetyModel)
+                    GroupModerationSection(
+                        model: safetyModel,
+                        canModerate: canModerate,
+                        onForgotten: { workspace.closeGroupDetails() }
+                    )
+
                     if snapshot.pendingConfirmation {
                         Section(L10n.string("Invitation")) {
                             VStack(alignment: .leading, spacing: 10) {
@@ -341,7 +356,7 @@ struct GroupDetailsSheet: View {
                         }
                     }
 
-                    GroupSharedMediaSection(groupIdHex: snapshot.groupIdHex)
+                    RetainedSharedMediaSection(model: attachmentModel)
 
                     Section {
                         if snapshot.members.isEmpty {
@@ -600,11 +615,8 @@ struct GroupDetailsSheet: View {
         .background {
             MessagesTranscriptBackground()
         }
-        .task(id: chat.id) {
-            await workspace.loadSharedMedia(groupIdHex: chat.id)
-        }
-        .onDisappear {
-            workspace.clearSharedMedia()
+        .task(id: "\(chat.id):\(canModerate)") {
+            await safetyModel.load(canModerate: canModerate)
         }
         .sheet(isPresented: $isAddMembersPresented) {
             GroupAddMembersSheet(
@@ -824,9 +836,16 @@ struct GroupMemberRow: View {
 struct ContactDetailsView: View {
     @Environment(WorkspaceState.self) private var workspace
     let contact: NewChatRecipient
+    let blockedUsersModel: BlockedUsersViewModel
 
-    private var isSelf: Bool {
-        workspace.activeAccount?.accountIdHex.lowercased() == contact.accountIdHex.lowercased()
+    private var isLocalProfile: Bool {
+        workspace.accounts.contains {
+            $0.accountIdHex.lowercased() == contact.accountIdHex.lowercased()
+        }
+    }
+
+    private var isBlocked: Bool {
+        blockedUsersModel.isBlocked(accountID: contact.accountIdHex)
     }
 
     var body: some View {
@@ -850,7 +869,7 @@ struct ContactDetailsView: View {
                     Text(contact.title)
                         .wnFont(.semiBold16)
                         .lineLimit(1)
-                    Text(isSelf ? L10n.string("You") : L10n.string("Contact"))
+                    Text(isLocalProfile ? L10n.string("You") : L10n.string("Contact"))
                         .wnFont(.medium12)
                         .foregroundStyle(WNColor.backgroundContentSecondary)
                 }
@@ -869,8 +888,12 @@ struct ContactDetailsView: View {
             // Follow and Message lead the profile, above every detail row, so neither can be
             // missed. `isSelf` only covers the active account; the follow control hides itself
             // for any other identity signed in on this device.
-            if !isSelf {
-                ContactProfileActionsRow(contact: contact)
+            if !isLocalProfile {
+                if isBlocked {
+                    BlockedContactNotice()
+                } else {
+                    ContactProfileActionsRow(contact: contact)
+                }
 
                 GlassSeparator(axis: .horizontal)
             }
@@ -957,6 +980,13 @@ struct ContactDetailsView: View {
                             .wnFont(.medium10)
                             .foregroundStyle(WNColor.backgroundContentSecondary)
                     }
+                }
+
+                if !isLocalProfile {
+                    ContactBlockingSection(
+                        model: blockedUsersModel,
+                        accountID: contact.accountIdHex
+                    )
                 }
             }
             .formStyle(.grouped)

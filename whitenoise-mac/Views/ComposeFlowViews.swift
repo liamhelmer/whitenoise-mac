@@ -13,6 +13,7 @@ import SwiftUI
 
 struct NewChatPanelView: View {
     @Environment(WorkspaceState.self) private var workspace
+    @Environment(SessionState.self) private var session
 
     private var trimmedQuery: String {
         workspace.newChatQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -116,7 +117,7 @@ struct NewChatPanelView: View {
 
     @ViewBuilder
     private func contactRows(_ contacts: [ComposeContact]) -> some View {
-        ForEach(contacts) { contact in
+        ForEach(contacts.filter { isAllowed(accountID: $0.accountIdHex) }) { contact in
             ComposeContactRow(
                 title: contact.title,
                 subtitle: contact.subtitle,
@@ -133,7 +134,7 @@ struct NewChatPanelView: View {
 
     @ViewBuilder
     private func discoveredRows(_ people: [DiscoveredPerson]) -> some View {
-        ForEach(people) { person in
+        ForEach(people.filter { isAllowed(accountID: $0.accountIdHex) }) { person in
             DiscoveredPersonRow(
                 person: person,
                 isBusy: workspace.creatingDirectChatIdHex == person.accountIdHex
@@ -163,12 +164,17 @@ struct NewChatPanelView: View {
         guard let value = NSPasteboard.general.string(forType: .string) else { return }
         workspace.newChatQuery = value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    private func isAllowed(accountID: String) -> Bool {
+        session.accountScope?.blockedUsers.isBlocked(accountID: accountID) != true
+    }
 }
 
 // MARK: - Choose members
 
 struct ChooseMembersPanelView: View {
     @Environment(WorkspaceState.self) private var workspace
+    @Environment(SessionState.self) private var session
 
     private var trimmedQuery: String {
         workspace.newChatQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -274,7 +280,7 @@ struct ChooseMembersPanelView: View {
 
     @ViewBuilder
     private func selectableRows(_ contacts: [ComposeContact]) -> some View {
-        ForEach(contacts) { contact in
+        ForEach(contacts.filter { isAllowed(accountID: $0.accountIdHex) }) { contact in
             ComposeContactRow(
                 title: contact.title,
                 subtitle: contact.subtitle,
@@ -290,7 +296,7 @@ struct ChooseMembersPanelView: View {
 
     @ViewBuilder
     private func selectableDiscoveredRows(_ people: [DiscoveredPerson]) -> some View {
-        ForEach(people) { person in
+        ForEach(people.filter { isAllowed(accountID: $0.accountIdHex) }) { person in
             DiscoveredPersonRow(
                 person: person,
                 selection: isSelected(accountIdHex: person.accountIdHex)
@@ -303,6 +309,10 @@ struct ChooseMembersPanelView: View {
 
     private func isSelected(accountIdHex: String) -> Bool {
         workspace.newChatRecipients.contains { $0.accountIdHex == accountIdHex }
+    }
+
+    private func isAllowed(accountID: String) -> Bool {
+        session.accountScope?.blockedUsers.isBlocked(accountID: accountID) != true
     }
 }
 
@@ -671,6 +681,7 @@ private struct UserDiscoveryModifier: ViewModifier {
 
 private struct ComposeIdentifierResults: View {
     @Environment(WorkspaceState.self) private var workspace
+    @Environment(SessionState.self) private var session
     private let selection: (NewChatRecipient) -> Bool?
     private let isBusy: (NewChatRecipient) -> Bool
     private let isDisabled: Bool
@@ -695,7 +706,9 @@ private struct ComposeIdentifierResults: View {
     var body: some View {
         if workspace.isResolvingNewChat {
             ComposeResolvingRow()
-        } else if let recipient = workspace.resolvedNewChatRecipient {
+        } else if let recipient = workspace.resolvedNewChatRecipient,
+            session.accountScope?.blockedUsers.isBlocked(accountID: recipient.accountIdHex) != true
+        {
             ComposeContactRow(
                 title: recipient.title,
                 subtitle: shortKey(npub: recipient.npub, hex: recipient.accountIdHex),

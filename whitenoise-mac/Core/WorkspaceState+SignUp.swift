@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import MarmotKit
 
 @MainActor
 extension WorkspaceState {
@@ -58,7 +59,8 @@ extension WorkspaceState {
 
     // MARK: - Committing
 
-    /// Create the identity, upload the staged photo under it, publish the profile, and go in.
+    /// Create the durable identity and Marmot-owned generated profile, upload the staged photo
+    /// under it, publish the user's optional edits, and go in.
     ///
     /// The order is `whitenoise`'s (`use_signup.dart`), and it is forced: a Blossom upload is
     /// signed by an account key, so the picture cannot become a URL before the identity exists,
@@ -80,18 +82,24 @@ extension WorkspaceState {
 
         do {
             if signUpCreatedAccountRef == nil {
-                let summary = try await client.createIdentity(
+                let existingAccountLabels = Set(accounts.map(\.accountRef))
+                let creation = try await client.createIdentityWithProfile(
                     defaultRelays: MarmotClient.seedRelays,
                     bootstrapRelays: MarmotClient.seedRelays
                 )
+                // MDK coalesces a retry while secure setup is still publishing. Treat a returned
+                // pre-existing label as recovery, not as a newly-created editable identity.
+                guard !existingAccountLabels.contains(creation.account.label) else {
+                    throw MarmotKitError.AccountSetupRetryRequired
+                }
                 // Recorded before the two calls that can still throw, not after: a `start()` or an
                 // account refresh that fails leaves an identity on disk either way, and a retry
                 // that had not recorded it would mint a second one and abandon the first.
-                signUpCreatedAccountRef = AccountItem(summary: summary).accountRef
+                signUpCreatedAccountRef = AccountItem(summary: creation.account).accountRef
                 // Same ordering rule as `signUp()` / `login()`: wait until `start()` succeeds so a
                 // failure leaves the previously ready account intact (#333).
                 try await bringRuntimeOnline(client)
-                try await refreshAccounts(preferred: summary)
+                try await refreshAccounts(preferred: creation.account)
             }
 
             guard let account = activeAccount, let accountRef = signUpCreatedAccountRef else {

@@ -137,29 +137,23 @@ extension WorkspaceState {
         }
 
         do {
-            let subscription = try await client.subscribeChatList(
+            let snapshot = try await client.presentedChatList(
                 accountRef: activeAccount.accountRef,
                 includeArchived: true
             )
             guard canContinueChatListReload(generation: generation, accountId: accountId) else { return }
-
-            let rows = try await FFIExecutor.run { subscription.snapshot() }
-            guard canContinueChatListReload(generation: generation, accountId: accountId) else { return }
-            // Start the listener before applying the snapshot rows. `startChatListListener`
-            // tears down the previous listener (which cancels any in-flight enrichment), so it
-            // must run before `applyChatRows` starts the fresh full-snapshot enrichment task —
-            // otherwise the listener-start teardown cancels that enrichment before its body ever
-            // runs on the main actor, leaving non-selected direct chats on their raw fallback.
-            startChatListListener(account: activeAccount, subscription: subscription)
-            guard canContinueChatListReload(generation: generation, accountId: accountId) else { return }
-            await applyChatRows(rows, account: activeAccount, refreshingAccountUnreadSummary: false)
+            let prepared = Dictionary(
+                snapshot.rows.map { ($0.row.groupIdHex, $0) },
+                uniquingKeysWith: { _, latest in latest }
+            )
+            await applyChatRows(
+                snapshot.rows.map(\.row),
+                account: activeAccount,
+                preparedRows: prepared
+            )
 
             guard canContinueChatListReload(generation: generation, accountId: accountId) else { return }
             await selectInitialChatIfNeeded()
-            guard canContinueChatListReload(generation: generation, accountId: accountId) else { return }
-            // Unconditional, unlike the row-gated refreshes: a reload is the one point that also
-            // re-reads the *other* accounts' totals, which no row delta of ours can move.
-            await refreshAccountUnreadSummary()
         } catch is CancellationError {
             return
         } catch {
@@ -184,103 +178,72 @@ extension WorkspaceState {
         isRefreshing = false
     }
 
-    func startChatListListener(
-        account: AccountItem,
-        subscription: ChatListSubscription? = nil
-    ) {
-        guard client != nil else { return }
-        stopChatListListener()
-        guard activeAccountId == account.id else { return }
-        chatListTaskAccountId = account.id
-        chatListTask = Task { [weak self] in
-            await self?.runChatListListener(
-                account: account,
-                existingSubscription: subscription
-            )
-        }
-    }
-
+    /// Cancels only compatibility enrichment work. Live prepared chat-list observation belongs to
+    /// `AccountScope.ChatListViewModel`; WorkspaceState must never open a competing subscription.
     func stopChatListListener() {
-        chatListTask?.cancel()
-        chatListTask = nil
-        chatListTaskAccountId = nil
         chatListEnrichmentTask?.cancel()
         chatListEnrichmentTask = nil
         chatListRowEnrichment.cancelAll()
     }
 
-    func runChatListListener(
-        account: AccountItem,
-        existingSubscription: ChatListSubscription? = nil
-    ) async {
-        guard let client else { return }
-        var reconnectAttempt = 0
-        var pendingSubscription = existingSubscription
-
-        while !Task.isCancelled, activeAccountId == account.id {
-            do {
-                let subscription: ChatListSubscription
-                if let existing = pendingSubscription {
-                    subscription = existing
-                    pendingSubscription = nil
-                } else {
-                    subscription = try await client.subscribeChatList(
-                        accountRef: account.accountRef,
-                        includeArchived: true
-                    )
-                    guard activeAccountId == account.id, !Task.isCancelled else { break }
-                    let rows = try await FFIExecutor.run { subscription.snapshot() }
-                    guard activeAccountId == account.id, !Task.isCancelled else { break }
-                    await applyChatRows(rows, account: account)
-                }
-
-                while !Task.isCancelled, activeAccountId == account.id {
-                    guard let update = await subscription.nextUpdate() else { break }
-                    guard !Task.isCancelled, activeAccountId == account.id else { break }
-                    reconnectAttempt = 0
-                    await applyChatListSubscriptionUpdate(update, account: account)
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                if activeAccountId == account.id {
-                    setBackgroundStatus(error.localizedDescription)
-                }
-            }
-
-            guard !Task.isCancelled, activeAccountId == account.id else { break }
-            do {
-                try await waitBeforeListenerReconnect(attempt: reconnectAttempt)
-            } catch is CancellationError {
-                return
-            } catch {
-                if activeAccountId == account.id {
-                    setBackgroundStatus(error.localizedDescription)
-                }
-            }
-            reconnectAttempt += 1
-        }
-
-        if chatListTaskAccountId == account.id && !Task.isCancelled {
-            chatListTask = nil
-            chatListTaskAccountId = nil
-        }
-    }
-
-    /// - Parameter refreshingAccountUnreadSummary: whether this pass owns the unread-summary
-    ///   refresh. A full reload runs its own unconditional refresh right after (the one moment
-    ///   background accounts' totals are re-read), so it opts out rather than query twice.
     func applyChatRows(
         _ rows: [ChatListRowFfi],
         account: AccountItem,
-        refreshingAccountUnreadSummary: Bool = true
+        preparedRows: [String: PresentedChatRowFfi] = [:],
+        preparedAvatarBytes: [String: AvatarBytesFfi]? = nil
     ) async {
         guard activeAccountId == account.id else { return }
 
         let activeRows = rows.filter { !$0.archived }
         let archivedRows = rows.filter(\.archived)
-        let activeItems = activeRows.map { baseChatItem(from: $0, account: account) }
-        let archivedItems = archivedRows.map { baseChatItem(from: $0, account: account) }
+        let nicknames = contactNicknames(forOwnerAccountIdHex: account.accountIdHex)
+        let readyAvatarReferences = Array(
+            Set(
+                preparedRows.values.compactMap { presented -> String? in
+                    guard presented.avatarAsset?.availability == .ready else { return nil }
+                    return presented.avatarAsset?.reference
+                }))
+        let avatarBytesByReference: [String: AvatarBytesFfi]
+        if let preparedAvatarBytes {
+            avatarBytesByReference = preparedAvatarBytes
+        } else if let client, !readyAvatarReferences.isEmpty,
+            let payloads = try? await client.readAvatarAssets(
+                accountRef: account.accountRef,
+                references: readyAvatarReferences,
+                maxBytes: 32 * 1_024 * 1_024
+            )
+        {
+            avatarBytesByReference = Dictionary(
+                payloads.map { ($0.reference, $0) },
+                uniquingKeysWith: { _, latest in latest }
+            )
+        } else {
+            avatarBytesByReference = [:]
+        }
+        guard activeAccountId == account.id, !Task.isCancelled else { return }
+        let item: (ChatListRowFfi) -> ChatItem = { row in
+            guard let prepared = preparedRows[row.groupIdHex] else {
+                return self.baseChatItem(from: row, account: account)
+            }
+            let peerNickname = prepared.presentation.peerId.flatMap {
+                nicknames.nickname(forContactAccountIdHex: $0)
+            }
+            let senderNickname: String?
+            if let sender = row.lastMessage?.sender {
+                senderNickname = nicknames.nickname(forContactAccountIdHex: sender)
+            } else {
+                senderNickname = nil
+            }
+            return ChatItem(
+                presented: prepared,
+                activeAccountIdHex: account.accountIdHex,
+                nickname: peerNickname,
+                lastSenderNickname: senderNickname,
+                avatarBytes: prepared.avatarAsset?.reference.flatMap { avatarBytesByReference[$0] }
+            )
+        }
+        let activeItems = activeRows.map(item)
+        let archivedItems = archivedRows.map(item)
 
         let previousActiveChatIds = Set((chatsByAccount[account.id] ?? []).map(\.id))
         let nextActiveChatIds = Set(activeItems.map(\.id))
@@ -320,10 +283,11 @@ extension WorkspaceState {
         dismissGroupImagePickerIfSelectedChatUnavailable()
         cancelVoiceRecordingIfSelectedMembershipEnded()
         ensureSelectedMessageTimelineStore()
-        startChatListEnrichment(rows: rows, account: account)
-        if refreshingAccountUnreadSummary {
-            await refreshAccountUnreadSummaryIfChatRowsMovedIt()
+        if preparedRows.isEmpty {
+            startChatListEnrichment(rows: rows, account: account)
         }
+        // AccountScope's live account-attention projection owns rail badges. Chat rows no longer
+        // trigger a second one-shot unread query.
     }
 
     /// A membership flip to left/removed swaps the selected chat's composer (its recording
@@ -351,9 +315,6 @@ extension WorkspaceState {
         case .removeRow(trigger: _, let groupIdHex):
             removeChat(groupIdHex: groupIdHex, account: account)
             removeArchivedChatFromList(chatId: groupIdHex, forAccountId: account.id)
-            // A removed chat takes its unread messages with it, so the avatar badge has to drop
-            // them too — `removeChat` is synchronous and has no other summary hook.
-            await refreshAccountUnreadSummaryIfChatRowsMovedIt()
         case .snapshot(let trigger, let rows):
             for row in rows {
                 invalidateGroupMemberDetailsCacheIfNeeded(trigger: trigger, groupIdHex: row.groupIdHex)
@@ -362,13 +323,34 @@ extension WorkspaceState {
         }
     }
 
+    /// Temporary view-layer bridge from the complete prepared-list contract into the legacy chat
+    /// selection store. The subscription and presentation remain owned by `ChatListViewModel`;
+    /// this method applies one complete replacement atomically so removed selections, sheets, and
+    /// per-chat resources are reconciled in the same pass.
+    func applyPresentedChatListSnapshot(
+        _ snapshot: PresentedChatListSnapshotFfi,
+        account: AccountItem,
+        avatarBytesByReference: [String: AvatarBytesFfi] = [:]
+    ) async {
+        let prepared = Dictionary(
+            snapshot.rows.map { ($0.row.groupIdHex, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        await applyChatRows(
+            snapshot.rows.map(\.row),
+            account: account,
+            preparedRows: prepared,
+            preparedAvatarBytes: avatarBytesByReference
+        )
+    }
+
     /// Whether a live chat-list delta can change the metadata enrichment resolves
     /// (direct-chat title/avatar/`isDirect`). Metadata-invariant triggers only carry
     /// unread/preview/timestamp/pending-confirmation changes, so they take the
     /// `shouldEnrich: false` fast path and never trigger the per-row FFI fan-out.
     func chatListTriggerRequiresEnrichment(_ trigger: ChatListUpdateTriggerFfi) -> Bool {
         switch trigger {
-        case .newLastMessage, .lastMessageDeleted, .latestMessageDeliveryChanged,
+        case .newLastMessage, .lastMessageDeleted, .lastMessageContentChanged, .latestMessageDeliveryChanged,
             .pendingConfirmationChanged, .unreadChanged, .manualUnreadChanged, .muteChanged,
             .pinOrderChanged:
             return false
@@ -391,7 +373,6 @@ extension WorkspaceState {
             if shouldEnrich {
                 startChatListEnrichment(rows: [row], account: account, replacingCurrent: false)
             }
-            await refreshAccountUnreadSummaryIfChatRowsMovedIt()
             return
         }
 
@@ -427,10 +408,7 @@ extension WorkspaceState {
             readStateMetadataEnrichmentAttempts.insert(row.groupIdHex)
             await enrichChatRows([row], account: account)
         }
-        // The read-state fast path lands here: a marker advance clears the row's unread count, and
-        // the avatar badge above the chat list has to follow it down rather than wait for the next
-        // reload or account switch.
-        await refreshAccountUnreadSummaryIfChatRowsMovedIt()
+        // Account attention moves the rail badge on the same durable read-state update.
     }
 
     func moveChatToArchived(row: ChatListRowFfi, account: AccountItem) {

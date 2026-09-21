@@ -45,6 +45,14 @@
 	<string>$(WN_TELEMETRY_ENVIRONMENT)</string>
 	<key>WhiteNoiseTelemetryOTLPEndpoint</key>
 	<string>$(WN_OTLP_ENDPOINT)</string>
+	<key>WhiteNoiseProductAnalyticsEndpoint</key>
+	<string>$(WN_PRODUCT_ANALYTICS_ENDPOINT)</string>
+	<key>WhiteNoiseProductAnalyticsAppKey</key>
+	<string>$(WN_PRODUCT_ANALYTICS_APP_KEY)</string>
+	<key>WhiteNoiseProductAnalyticsOperator</key>
+	<string>$(WN_PRODUCT_ANALYTICS_OPERATOR)</string>
+	<key>WhiteNoiseProductAnalyticsRetention</key>
+	<string>$(WN_PRODUCT_ANALYTICS_RETENTION)</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.social-networking</string>
 	<key>LSMinimumSystemVersion</key>

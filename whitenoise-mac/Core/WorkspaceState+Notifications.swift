@@ -25,11 +25,8 @@ extension WorkspaceState {
         // in flight owns the newer published snapshot; do not clobber it on resume.
         let notificationSettingsGenerationAtStart = notificationSettingsGeneration
 
-        // The client-wide notification stream is the only live word the app gets about a background
-        // account's incoming messages, so its avatar badge is refreshed from here. This sits above
-        // the delivery gates below on purpose: the badge tracks unread messages, not whether the
-        // user wants banners for them, so a muted account must still count up in the rail.
-        await refreshAccountUnreadSummaryForBackgroundAccount(receiving: update)
+        // The client-wide account-attention projection owns background-account badge changes;
+        // notification delivery must not launch a parallel one-shot summary read.
 
         // Read the account's notification settings exactly once over the FFI
         // boundary, then reuse the snapshot for both responsibilities below:

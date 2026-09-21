@@ -11,6 +11,8 @@ ENTITLEMENTS="whitenoise-mac/whitenoise-mac.entitlements"
 MARMOT_PACKAGE="Vendored/MarmotKit/Package.swift"
 MARMOT_VERSION_FILE="Vendored/MarmotKit/MARMOT_VERSION"
 MARMOT_SWIFT_SOURCE="Vendored/MarmotKit/Sources/MarmotKit/MarmotKit.swift"
+MARMOT_SWIFT_VERSION="Vendored/MarmotKit/Sources/MarmotKit/MarmotKitVersion.swift"
+MARMOT_PRIVACY_RESOURCE="Vendored/MarmotKit/Sources/MarmotKit/Resources/PrivacyInfo.xcprivacy"
 
 fail() {
   echo "error: $*" >&2
@@ -124,11 +126,45 @@ stamped_tag="$(sed -nE 's/^mdk-tag: (.*)$/\1/p' "$MARMOT_VERSION_FILE")"
 stamped_checksum="$(sed -nE 's/^swiftpm-checksum: (.*)$/\1/p' "$MARMOT_VERSION_FILE")"
 stamped_targets="$(sed -nE 's/^macos-targets: (.*)$/\1/p' "$MARMOT_VERSION_FILE")"
 stamped_floor="$(sed -nE 's/^macos-deployment-target: (.*)$/\1/p' "$MARMOT_VERSION_FILE")"
+stamped_distribution="$(sed -nE 's/^distribution: (.*)$/\1/p' "$MARMOT_VERSION_FILE")"
+stamped_privacy_sha="$(sed -nE 's/^privacy-sha256: (.*)$/\1/p' "$MARMOT_VERSION_FILE")"
 
 [[ "$stamped_tag" == "$marmot_release_tag" ]] \
   || fail "$MARMOT_VERSION_FILE tag '$stamped_tag' does not match $MARMOT_PACKAGE tag '$marmot_release_tag'"
 [[ "$stamped_checksum" == "$marmot_checksum" ]] \
   || fail "$MARMOT_VERSION_FILE checksum does not match the checksum pinned in $MARMOT_PACKAGE"
+
+generated_version_value() {
+  local name="$1"
+  sed -nE "s/^[[:space:]]*public static let $name = \"(.*)\"$/\\1/p" "$MARMOT_SWIFT_VERSION"
+}
+
+[[ "$(generated_version_value mdkTag)" == "$stamped_tag" ]] \
+  || fail "$MARMOT_SWIFT_VERSION mdkTag does not match $MARMOT_VERSION_FILE"
+[[ "$(generated_version_value swiftPMChecksum)" == "$stamped_checksum" ]] \
+  || fail "$MARMOT_SWIFT_VERSION swiftPMChecksum does not match $MARMOT_VERSION_FILE"
+[[ "$(generated_version_value distribution)" == "$stamped_distribution" ]] \
+  || fail "$MARMOT_SWIFT_VERSION distribution does not match $MARMOT_VERSION_FILE"
+[[ "$(generated_version_value privacySHA256)" == "$stamped_privacy_sha" ]] \
+  || fail "$MARMOT_SWIFT_VERSION privacySHA256 does not match $MARMOT_VERSION_FILE"
+
+if [[ "$stamped_distribution" == "static-library-and-privacy-v1" ]]; then
+  [[ "$stamped_privacy_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "$MARMOT_VERSION_FILE is missing a valid privacy-sha256 stamp"
+  [[ -f "$MARMOT_PRIVACY_RESOURCE" ]] \
+    || fail "$MARMOT_PRIVACY_RESOURCE is required for static-library MarmotKit releases"
+  plutil -lint "$MARMOT_PRIVACY_RESOURCE" >/dev/null
+  computed_privacy_sha="$(shasum -a 256 "$MARMOT_PRIVACY_RESOURCE" | awk '{ print $1 }')"
+  [[ "$computed_privacy_sha" == "$stamped_privacy_sha" ]] \
+    || fail "$MARMOT_PRIVACY_RESOURCE digest does not match the $MARMOT_VERSION_FILE stamp"
+  grep -Fq 'resources: [.copy("Resources/PrivacyInfo.xcprivacy")]' "$MARMOT_PACKAGE" \
+    || fail "$MARMOT_PACKAGE must copy the MarmotKit privacy resource"
+elif [[ "$stamped_distribution" == "legacy-framework" ]]; then
+  [[ "$stamped_privacy_sha" == "embedded-in-framework" ]] \
+    || fail "$MARMOT_VERSION_FILE legacy framework must stamp embedded-in-framework privacy"
+else
+  fail "$MARMOT_VERSION_FILE has unsupported distribution '$stamped_distribution'"
+fi
 
 # The generated Swift source is the one part of the package that is tracked as
 # text and so can be edited by hand. Nothing else notices if it is: the checks
@@ -141,6 +177,8 @@ stamped_swift_sha="$(sed -nE 's/^swift-vendored-sha256: (.*)$/\1/p' "$MARMOT_VER
 computed_swift_sha="$(shasum -a 256 "$MARMOT_SWIFT_SOURCE" | awk '{ print $1 }')"
 [[ "$computed_swift_sha" == "$stamped_swift_sha" ]] \
   || fail "$MARMOT_SWIFT_SOURCE digest $computed_swift_sha does not match the $MARMOT_VERSION_FILE stamp $stamped_swift_sha"
+[[ "$(generated_version_value vendoredSwiftSHA256)" == "$stamped_swift_sha" ]] \
+  || fail "$MARMOT_SWIFT_VERSION vendoredSwiftSHA256 does not match $MARMOT_VERSION_FILE"
 
 # The published macOS artifact is Apple Silicon only. If that ever changes
 # upstream this fires, rather than the app silently staying arm64-only.

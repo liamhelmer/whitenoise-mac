@@ -5,9 +5,8 @@
 //  The one-time "Help Improve White Noise" choice, offered once per identity right after it first
 //  reaches Chats.
 //
-//  Both toggles it presents are the Privacy & Security ones — `setRelayTelemetryEnabled` and
-//  `setAuditLoggingEnabled` — so there is nothing to commit when the sheet closes and no third
-//  state to keep in step. What lives here is only *when to ask*.
+//  The sheet writes through the account-scoped diagnostics model, so there is no separate
+//  settings store to commit when it closes. What lives here is only *when to ask*.
 //
 
 import Foundation

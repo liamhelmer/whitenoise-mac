@@ -575,11 +575,11 @@ struct ChatListTests: WorkspaceTestSupport {
         runtime.installChatListUpdates([
             .removeRow(trigger: .removed, groupIdHex: "group")
         ])
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
+        let model = ChatListViewModel(account: AccountItem(summary: account), runtime: runtime)
+        model.start()
+        defer { model.stop() }
         let didApplyRemoval = await waitFor {
-            state.activeChats.map(\.id) == ["direct-group"]
+            model.presentedRows.map(\.row.groupIdHex) == ["direct-group"]
         }
 
         #expect(didApplyRemoval)
@@ -783,7 +783,7 @@ struct ChatListTests: WorkspaceTestSupport {
     }
 
     @MainActor
-    @Test func subscriptionSnapshotsRunOffMainThread() async throws {
+    @Test func projectionSnapshotsRunOffMainThread() async throws {
         let account = AccountSummaryFfi(
             label: "Desktop Account",
             accountIdHex: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
@@ -805,7 +805,9 @@ struct ChatListTests: WorkspaceTestSupport {
 
         runtime.chatListStreamEndsAfterUpdates = true
         let chatListSubscriptionBaseline = runtime.chatListSubscriptionCount
-        await state.reloadChats()
+        let chatListModel = ChatListViewModel(account: AccountItem(summary: account), runtime: runtime)
+        chatListModel.start()
+        defer { chatListModel.stop() }
         let didReconnectChatList = await waitFor {
             runtime.chatListSubscriptionCount >= chatListSubscriptionBaseline + 2
         }
@@ -1947,16 +1949,16 @@ struct ChatListTests: WorkspaceTestSupport {
         runtime.installChatListUpdates([
             .row(trigger: .newLastMessage, row: updatedRow)
         ])
-        let state = WorkspaceState(clientFactory: { runtime })
-
-        await state.bootstrap()
+        let model = ChatListViewModel(account: AccountItem(summary: account), runtime: runtime)
+        model.start()
+        defer { model.stop() }
         let didPreserveMetadata = await waitFor(attempts: 300) {
-            state.activeChats.first?.title == "Alice Actual"
-                && state.activeChats.first?.preview == "See you soon."
+            let chat = model.chats(view: .chats, nicknames: .none).first
+            return chat?.title == "Alice Actual" && chat?.preview == "See you soon."
         }
 
         if !didPreserveMetadata {
-            let chat = state.activeChats.first
+            let chat = model.chats(view: .chats, nicknames: .none).first
             Issue.record(
                 """
                 Expected direct-chat metadata preservation. \
@@ -1967,11 +1969,12 @@ struct ChatListTests: WorkspaceTestSupport {
             )
         }
         #expect(didPreserveMetadata)
-        #expect(state.activeChats.first?.isDirect == true)
-        #expect(state.activeChats.first?.pictureURL == "https://example.com/alice.png")
-        // The incremental row reuses the initial membership lookup for non-membership triggers;
-        // it must not re-query group details just to refresh the last-message preview (#9).
-        #expect((runtime.groupDetailsCallCounts["direct-group"] ?? 0) == 1)
+        let chat = model.chats(view: .chats, nicknames: .none).first
+        #expect(chat?.isDirect == true)
+        #expect(chat?.pictureURL == "https://example.com/alice.png")
+        // Prepared presentation carries the peer identity and avatar in both complete snapshots;
+        // neither the initial list nor its replacement may fan out to group details (#9).
+        #expect((runtime.groupDetailsCallCounts["direct-group"] ?? 0) == 0)
     }
 
     @MainActor

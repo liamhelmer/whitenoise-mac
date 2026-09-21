@@ -17,7 +17,7 @@
 import SwiftUI
 
 struct AddRelaySheet: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: RelaySettingsViewModel
     @Environment(\.dismiss) private var dismiss
 
     @State private var relayURL = ""
@@ -33,7 +33,7 @@ struct AddRelaySheet: View {
     private var isDuplicate: Bool {
         let key = RelayURLValidator.identity(normalizedURL)
         guard !key.isEmpty else { return false }
-        return workspace.relayEndpoints.contains { $0.id == key }
+        return model.endpoints.contains { $0.id == key }
     }
 
     /// Malformed only once something has been typed, so an untouched field is not scolded.
@@ -46,7 +46,7 @@ struct AddRelaySheet: View {
             && !isMalformed
             && !isDuplicate
             && !selectedRoles.isEmpty
-            && !workspace.isSavingRelays
+            && !model.isSaving
     }
 
     var body: some View {
@@ -162,11 +162,10 @@ struct AddRelaySheet: View {
         let relay = normalizedURL
         let roles = selectedRoles
         dismiss()
-        Task { await workspace.addRelay(relay, roles: roles) }
+        Task { await model.addRelay(relay, roles: roles) }
     }
 }
 
 #Preview {
-    AddRelaySheet()
-        .environment(WorkspaceState.preview())
+    AddRelaySheet(model: RelaySettingsViewModel(accountRef: "preview", runtime: nil))
 }

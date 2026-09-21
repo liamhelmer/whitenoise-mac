@@ -146,6 +146,6 @@ struct DonationMethodTests {
         let card = try #require(
             SettingsPage.sidebarGroups.first(where: { $0.contains(.donate) })
         )
-        #expect(card == [.preferences, .donate, .developerMode])
+        #expect(card == [.preferences, .support, .donate, .developerMode])
     }
 }

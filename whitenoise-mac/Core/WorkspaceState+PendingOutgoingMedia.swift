@@ -2,9 +2,9 @@
 //  WorkspaceState+PendingOutgoingMedia.swift
 //  whitenoise-mac
 //
-//  The half of a media send that outlives the Send press: awaiting the Blossom uploads that
-//  staging started, then publishing. Send itself never waits for either — it empties the composer
-//  and parks the message here, where the transcript renders it as a loading bubble.
+//  The half of a media send that outlives the Send press. MarmotKit owns the atomic retained-media
+//  upload and durable local admission; the app parks one tokenized placeholder here until the
+//  authoritative conversation projection returns the row carrying that exact token.
 //
 
 import Foundation
@@ -14,10 +14,9 @@ import MarmotKit
 extension WorkspaceState {
     /// Parks a just-sent media message and starts the work that will publish it.
     ///
-    /// `adoptedUploads` are the stage-time uploads already in flight for these attachments, handed
-    /// over by the composer so the wait continues from where staging got to instead of restarting.
-    /// Anything not covered there — an upload that failed, or one that never started — is uploaded
-    /// here, concurrently with the rest.
+    /// `adoptedUploads` are stage-time previews that must be cancelled once Send transfers
+    /// ownership to MarmotKit's atomic upload-and-admit operation. They cannot be reused as the
+    /// authoritative send because doing so would split retained-file ownership from admission.
     func beginPendingOutgoingMediaSend(
         _ message: PendingOutgoingMediaMessage,
         adoptedUploads: [PendingMediaAttachment.ID: Task<MediaAttachmentReferenceFfi?, Never>],
@@ -46,9 +45,8 @@ extension WorkspaceState {
         }
     }
 
-    /// Re-runs a failed outgoing message from wherever it got to. Uploads are not adopted — the
-    /// tasks that would have carried them are the ones that failed — so every attachment is
-    /// uploaded again, which is also what recovers a message whose blobs never landed.
+    /// Re-runs a failed outgoing message with the same durable client token. MarmotKit decides
+    /// whether this is a retry of retained bytes or an already-admitted message.
     func retryPendingOutgoingMediaMessage(_ id: PendingOutgoingMediaMessage.ID) {
         guard let draftKey = selectedComposerDraftKey,
             let index = pendingOutgoingMediaMessagesByConversation[draftKey]?.firstIndex(where: { $0.id == id }),
@@ -57,9 +55,6 @@ extension WorkspaceState {
             let client
         else { return }
         pendingOutgoingMediaMessagesByConversation[draftKey]?[index].state = .uploading
-        // The retry re-uploads from scratch, so last attempt's digests describe nothing that is on
-        // its way out any more. Left behind, they would hide the bubble the retry just relit.
-        pendingOutgoingMediaMessagesByConversation[draftKey]?[index].publishedPlaintextSHAs = []
         pendingOutgoingMediaSendTasks[id]?.cancel()
         pendingOutgoingMediaSendTasks[id] = Task { [weak self] in
             await self?.completePendingOutgoingMediaSend(
@@ -112,70 +107,68 @@ extension WorkspaceState {
     ) async {
         guard let message = pendingOutgoingMediaMessage(id, in: draftKey) else { return }
 
-        let uploads = message.attachments.map { attachment in
-            adoptedUploads[attachment.id]
-                ?? outgoingMediaUploadTask(
-                    attachment,
-                    accountRef: account.accountRef,
-                    groupIdHex: draftKey.chatId,
-                    client: client
-                )
-        }
-        pendingOutgoingMediaUploadTasks[id] = uploads
-
-        // Every upload is already running; awaiting them in composer order only fixes the order of
-        // the references, never the order they are allowed to finish in.
-        var references: [MediaAttachmentReferenceFfi] = []
-        for upload in uploads {
-            guard let reference = await upload.value else {
-                // One failure sinks the message, so the siblings still in flight are transferring
-                // bytes nobody will publish. A retry starts them over from scratch.
-                for sibling in pendingOutgoingMediaUploadTasks.removeValue(forKey: id) ?? [] {
-                    sibling.cancel()
-                }
-                setPendingOutgoingMediaMessageState(.failed, for: id, in: draftKey)
-                return
-            }
-            references.append(reference)
+        // Stage-time uploads exist only to make the composer responsive. Once the user presses
+        // Send, one MarmotKit call must own both retained bytes and durable admission. Letting the
+        // preview uploads finish would create two independent retained-file lifetimes.
+        for upload in adoptedUploads.values {
+            upload.cancel()
         }
         pendingOutgoingMediaUploadTasks[id] = nil
-        guard !Task.isCancelled, pendingOutgoingMediaMessage(id, in: draftKey) != nil else { return }
-
-        // Stamped before the publish, not after it: the core commits an own send locally as part of
-        // publishing, so the real row can reach the transcript through the subscription while we
-        // are still awaiting the relay. These digests are what let it hide this bubble on arrival
-        // instead of leaving the two stacked for the length of the round-trip.
-        setPendingOutgoingMediaPublishedDigests(
-            Set(references.map { $0.plaintextSha256.lowercased() }),
-            for: id,
-            in: draftKey
-        )
-        setPendingOutgoingMediaMessageState(.publishing, for: id, in: draftKey)
-
-        // We are holding the plaintext that produced these references, so the sender's own bubble
-        // has no reason to fetch its own image back from Blossom and decrypt it. Seed before
-        // publishing: the real row can render the moment the send returns, and it must find a warm
-        // cache when it does. Its *first* frame comes from this message's own attachments
-        // (`primeOwnSendMediaDownload`); the disk copy is what every render after that reads.
-        await cacheOutgoingMediaPlaintext(
-            message.attachments,
-            references: references,
-            accountId: account.id,
-            groupIdHex: draftKey.chatId
-        )
-        guard !Task.isCancelled, pendingOutgoingMediaMessage(id, in: draftKey) != nil else { return }
+        setPendingOutgoingMediaMessageState(.uploading, for: id, in: draftKey)
 
         do {
-            _ = try await client.sendMediaAttachments(
+            let submission = try await client.uploadMediaWithClientToken(
                 accountRef: account.accountRef,
                 groupIdHex: draftKey.chatId,
-                attachments: references,
-                caption: message.caption.isEmpty ? nil : message.caption
+                request: MediaUploadRequestFfi(
+                    attachments: message.attachments.map(\.uploadRequest),
+                    caption: message.caption.isEmpty ? nil : message.caption,
+                    send: true,
+                    blossomServer: nil
+                ),
+                clientToken: message.clientToken
             )
+            guard submission.acceptance != nil else {
+                throw MarmotKitError.InvalidMediaReference(
+                    details: "Media upload completed without durable message admission"
+                )
+            }
+            let references = submission.upload.attachments.compactMap(\.reference)
+            guard references.count == message.attachments.count else {
+                throw MarmotKitError.InvalidMediaReference(
+                    details: "One or more media attachments were not retained for sending"
+                )
+            }
+
+            // The retained references are now authoritative. Keep the old plaintext cache warm
+            // during the ownership migration, but never perform another host-side upload/send.
+            await cacheOutgoingMediaPlaintext(
+                message.attachments,
+                references: references,
+                accountId: account.id,
+                groupIdHex: draftKey.chatId
+            )
+            setPendingOutgoingMediaMessageState(.publishing, for: id, in: draftKey)
         } catch {
-            // The blobs are on Blossom and the references stay valid, so a retry only has to
-            // re-publish — but it re-uploads anyway rather than trusting a reference whose failure
-            // mode we cannot see from here.
+            // An interrupted host await can race durable local admission. Resolve that ambiguity
+            // with the same token rather than creating another semantic media send on retry.
+            if let status = try? client.localSendStatus(
+                accountRef: account.accountRef,
+                groupIdHex: draftKey.chatId,
+                clientToken: message.clientToken
+            ) {
+                switch status {
+                case .queued, .engineOwned, .completed:
+                    await refreshSelectedTimelineAfterSend(
+                        groupIdHex: draftKey.chatId,
+                        account: account,
+                        client: client
+                    )
+                    return
+                case .rejected:
+                    break
+                }
+            }
             lastError = error.localizedDescription
             setPendingOutgoingMediaMessageState(.failed, for: id, in: draftKey)
             return
@@ -193,46 +186,8 @@ extension WorkspaceState {
             account: account,
             client: client
         )
-        removePendingOutgoingMediaMessage(id, in: draftKey)
-    }
-
-    /// A Blossom upload owned by an outgoing message rather than by the composer.
-    ///
-    /// Deliberately not `beginPendingMediaUpload`: the attachment has already left the composer, so
-    /// there is no tile to report progress to and no entry in `pendingMediaUploadTasks` that anyone
-    /// would ever reclaim.
-    private func outgoingMediaUploadTask(
-        _ attachment: PendingMediaAttachment,
-        accountRef: String,
-        groupIdHex: String,
-        client: any MarmotRuntime
-    ) -> Task<MediaAttachmentReferenceFfi?, Never> {
-        Task { [weak self] () -> MediaAttachmentReferenceFfi? in
-            do {
-                let result = try await client.uploadMedia(
-                    accountRef: accountRef,
-                    groupIdHex: groupIdHex,
-                    request: MediaUploadRequestFfi(
-                        attachments: [attachment.uploadRequest],
-                        caption: nil,
-                        send: false,
-                        blossomServer: nil
-                    )
-                )
-                guard !Task.isCancelled else { return nil }
-                guard let reference = result.attachments.first?.reference else {
-                    self?.lastError = L10n.string("An attachment failed to upload")
-                    return nil
-                }
-                return reference
-            } catch is CancellationError {
-                return nil
-            } catch {
-                guard !Task.isCancelled else { return nil }
-                self?.lastError = error.localizedDescription
-                return nil
-            }
-        }
+        // Durable local admission is success, but only a projected row carrying this exact token
+        // can retire the pending bubble. The conversation snapshot bridge performs that match.
     }
 
     private func pendingOutgoingMediaMessage(
@@ -250,16 +205,6 @@ extension WorkspaceState {
         guard let index = pendingOutgoingMediaMessagesByConversation[draftKey]?.firstIndex(where: { $0.id == id })
         else { return }
         pendingOutgoingMediaMessagesByConversation[draftKey]?[index].state = state
-    }
-
-    private func setPendingOutgoingMediaPublishedDigests(
-        _ digests: Set<String>,
-        for id: PendingOutgoingMediaMessage.ID,
-        in draftKey: ComposerDraftKey
-    ) {
-        guard let index = pendingOutgoingMediaMessagesByConversation[draftKey]?.firstIndex(where: { $0.id == id })
-        else { return }
-        pendingOutgoingMediaMessagesByConversation[draftKey]?[index].publishedPlaintextSHAs = digests
     }
 
     private func removePendingOutgoingMediaMessage(

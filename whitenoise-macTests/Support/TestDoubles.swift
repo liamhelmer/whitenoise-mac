@@ -385,12 +385,18 @@ final class AtomicMax: @unchecked Sendable {
 
 struct TranscriptPerformanceRows: View {
     let messages: [MessageItem]
+    let safetyModel = GroupSafetyViewModel(
+        accountRef: "performance-account",
+        groupIdHex: "performance-group",
+        runtime: FakeMarmotRuntime(accounts: [])
+    )
 
     var body: some View {
         VStack(spacing: 12) {
             ForEach(messages) { message in
                 ConversationMessageRow(
                     message: message,
+                    safetyModel: safetyModel,
                     showsDebugMetadata: false
                 ) { _ in
                 } onNavigateToMessage: { _ in

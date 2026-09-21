@@ -8,9 +8,11 @@
 import AppKit
 import MarmotKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct DeveloperModeSettingsView: View {
     @Environment(WorkspaceState.self) private var workspace
+    let model: DiagnosticsSettingsViewModel
 
     var body: some View {
         @Bindable var workspace = workspace
@@ -42,6 +44,7 @@ struct DeveloperModeSettingsView: View {
             if workspace.developerMode {
                 SettingsSection {
                     SettingsNavigationRow(page: .keyPackages)
+                    SettingsNavigationRow(page: .quarantinedGroups)
                 }
             }
 
@@ -67,7 +70,7 @@ struct DeveloperModeSettingsView: View {
                 }
             }
 
-            AuditLogFilesSection()
+            AuditLogFilesSection(model: model)
 
         }
     }
@@ -82,7 +85,9 @@ struct DeveloperModeSettingsView: View {
 /// putting it on the privacy page buried the choice under an inventory. Turning logging on and
 /// off, and clearing what it wrote, stay on Privacy & Security; this group only looks.
 struct AuditLogFilesSection: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: DiagnosticsSettingsViewModel
+    @State private var exportingPath: String?
+    @State private var exportError: String?
 
     var body: some View {
         SettingsSection(
@@ -91,29 +96,85 @@ struct AuditLogFilesSection: View {
         ) {
             HStack(spacing: 10) {
                 Button {
-                    Task { await workspace.loadAuditLogFiles() }
+                    Task { await model.loadAuditLogs() }
                 } label: {
                     SettingsBusyLabel(
                         title: L10n.string("Refresh"),
                         systemImage: "arrow.clockwise",
-                        isBusy: workspace.isLoadingAuditLogFiles
+                        isBusy: model.isLoadingAuditLogs
                     )
                 }
                 .buttonStyle(.wnSecondary)
-                .disabled(workspace.isLoadingAuditLogFiles)
+                .disabled(model.isLoadingAuditLogs)
+
+                if DiagnosticLogExport.latestFile(in: model.auditLogFiles) != nil {
+                    Button {
+                        Task { await exportLog(path: nil) }
+                    } label: {
+                        SettingsBusyLabel(
+                            title: L10n.string("Export"),
+                            systemImage: "square.and.arrow.up",
+                            isBusy: exportingPath == ""
+                        )
+                    }
+                    .buttonStyle(.wnSecondary)
+                    .disabled(exportingPath != nil)
+                }
             }
 
-            if workspace.auditLogFiles.isEmpty {
+            if model.auditLogFiles.isEmpty {
                 Text(L10n.string("There are no logs."))
                     .foregroundStyle(WNColor.backgroundContentSecondary)
             } else {
-                ForEach(workspace.auditLogFiles, id: \.path) { file in
-                    AuditLogFileRow(file: file)
+                ForEach(model.auditLogFiles, id: \.path) { file in
+                    HStack(spacing: 10) {
+                        AuditLogFileRow(file: file)
+                        Button {
+                            Task { await exportLog(path: file.path) }
+                        } label: {
+                            if exportingPath == file.path {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "square.and.arrow.up")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(file.sizeBytes == 0 || exportingPath != nil)
+                        .help("\(L10n.string("Export")) \(file.fileName)")
+                    }
                 }
+            }
+
+            if let exportError {
+                SettingsErrorView(error: exportError)
             }
         }
         .task {
-            await workspace.loadAuditLogFiles()
+            await model.loadAuditLogs()
+        }
+    }
+
+    private func exportLog(path: String?) async {
+        guard exportingPath == nil else { return }
+        exportingPath = path ?? ""
+        defer { exportingPath = nil }
+        do {
+            let snapshot = try await model.diagnosticLogExport(path: path)
+            let panel = NSSavePanel()
+            panel.title = L10n.string("Export")
+            panel.prompt = L10n.string("Export")
+            panel.nameFieldStringValue = snapshot.fileName
+            panel.allowedContentTypes = [.json, .plainText, .data]
+            panel.allowsOtherFileTypes = true
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try snapshot.data.write(to: url, options: .atomic)
+            exportError = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            exportError = L10n.string("Something went wrong")
         }
     }
 }
@@ -163,4 +224,10 @@ struct AuditLogFileRow: View {
         guard capped.count > 14 else { return capped }
         return "\(capped.prefix(8))...\(capped.suffix(6))"
     }
+}
+
+#Preview {
+    DeveloperModeSettingsView(model: .preview())
+        .environment(WorkspaceState.preview())
+        .frame(width: 760, height: 640)
 }

@@ -1,6 +1,44 @@
 import Foundation
 import MarmotKit
 
+nonisolated extension UserDirectorySearchResultFfi {
+    init(
+        accountIdHex: String,
+        npub: String,
+        radius: UInt8,
+        matchedField: MatchedFieldFfi,
+        matchQuality: MatchQualityFfi,
+        providerRank: Double?,
+        profile: UserProfileMetadataFfi?
+    ) {
+        self.init(
+            accountIdHex: accountIdHex,
+            npub: npub,
+            radius: radius,
+            isFollowedBySearcher: false,
+            matchedField: matchedField,
+            matchQuality: matchQuality,
+            providerRank: providerRank,
+            profile: profile
+        )
+    }
+}
+
+nonisolated extension UserSearchUpdateFfi {
+    init(
+        trigger: SearchUpdateTriggerFfi,
+        newResults: [UserDirectorySearchResultFfi],
+        totalResultCount: UInt32
+    ) {
+        self.init(
+            trigger: trigger,
+            newResults: newResults,
+            updatedResults: [],
+            totalResultCount: totalResultCount
+        )
+    }
+}
+
 nonisolated extension SendSummaryFfi {
     /// Test convenience for fixtures that do not exercise maintenance deferral.
     /// These fixtures all report a published count, so the accept disposition
@@ -145,6 +183,38 @@ nonisolated extension ChatListMessagePreviewFfi {
         contentTokens: MarkdownDocumentFfi,
         kind: UInt64,
         timelineAt: UInt64,
+        deleted: Bool,
+        attachmentKind: ChatListAttachmentKindFfi?,
+        attachmentCount: UInt32,
+        deliveryState: ChatListMessageDeliveryStateFfi
+    ) {
+        self.init(
+            groupSystem: nil,
+            messageIdHex: messageIdHex,
+            sender: sender,
+            senderDisplayName: senderDisplayName,
+            plaintext: plaintext,
+            contentTokens: contentTokens,
+            kind: kind,
+            timelineAt: timelineAt,
+            retentionSeconds: nil,
+            retentionExpiresAt: nil,
+            deleted: deleted,
+            deletionSource: .unknown,
+            attachmentKind: attachmentKind,
+            attachmentCount: attachmentCount,
+            deliveryState: deliveryState
+        )
+    }
+
+    init(
+        messageIdHex: String,
+        sender: String,
+        senderDisplayName: String?,
+        plaintext: String,
+        contentTokens: MarkdownDocumentFfi,
+        kind: UInt64,
+        timelineAt: UInt64,
         deleted: Bool
     ) {
         self.init(
@@ -261,6 +331,7 @@ nonisolated extension GroupManagementStateFfi {
 
 nonisolated extension TimelineMessageRecordFfi {
     init(
+        clientToken: String? = nil,
         messageIdHex: String,
         sourceMessageIdHex: String?,
         direction: String,
@@ -284,6 +355,8 @@ nonisolated extension TimelineMessageRecordFfi {
         invalidationStatus: String?
     ) {
         self.init(
+            clientToken: clientToken,
+            hasReports: false,
             messageIdHex: messageIdHex,
             sourceMessageIdHex: sourceMessageIdHex,
             sourceEpoch: nil,
@@ -301,12 +374,47 @@ nonisolated extension TimelineMessageRecordFfi {
             replyToMessageIdHex: replyToMessageIdHex,
             replyPreview: replyPreview,
             mediaJson: mediaJson,
-            media: media,
+            media: media.enumerated().map {
+                .accepted(attachmentIndex: UInt32(clamping: $0.offset), reference: $0.element)
+            },
             agentTextStreamJson: agentTextStreamJson,
             groupSystem: groupSystem,
             reactions: reactions,
+            edit: nil,
             deleted: deleted,
+            deletionSource: .unknown,
             deletedByMessageIdHex: deletedByMessageIdHex,
+            invalidationStatus: invalidationStatus
+        )
+    }
+}
+
+nonisolated extension TimelineReplyPreviewFfi {
+    init(
+        messageIdHex: String,
+        sender: String,
+        plaintext: String,
+        contentTokens: MarkdownDocumentFfi,
+        kind: UInt64,
+        mediaJson: String?,
+        media: [MediaAttachmentReferenceFfi],
+        agentTextStreamJson: String?,
+        deleted: Bool,
+        invalidationStatus: String?
+    ) {
+        self.init(
+            messageIdHex: messageIdHex,
+            sender: sender,
+            plaintext: plaintext,
+            contentTokens: contentTokens,
+            kind: kind,
+            mediaJson: mediaJson,
+            media: media.enumerated().map {
+                .accepted(attachmentIndex: UInt32(clamping: $0.offset), reference: $0.element)
+            },
+            agentTextStreamJson: agentTextStreamJson,
+            deleted: deleted,
+            deletionSource: .unknown,
             invalidationStatus: invalidationStatus
         )
     }

@@ -85,7 +85,6 @@ extension WorkspaceState {
         // Cancel old downloads/stores before the purge and replace every visible attachment's
         // state. The disk cache's own generation gate independently rejects a stale direct store.
         resetMediaDownloadStateStores()
-        clearSharedMediaThumbnailCache()
         RemoteImageLoader.shared.clearLocalCache()
         mediaCacheGeneration &+= 1
 

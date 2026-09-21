@@ -9,6 +9,7 @@
 //
 
 import AppKit
+import MarmotKit
 import SwiftUI
 
 /// The unread count, and the shape every other unread signal in the app borrows.
@@ -29,6 +30,7 @@ struct UnreadCountBadge: View {
 
 struct AccountRailView: View {
     @Environment(WorkspaceState.self) private var workspace
+    @Environment(SessionState.self) private var session
 
     private var isSettingsSelected: Bool {
         if case .settings = workspace.selection { return true }
@@ -53,7 +55,12 @@ struct AccountRailView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 10) {
                     ForEach(workspace.signedInAccounts) { account in
-                        AccountRailAvatar(account: account)
+                        AccountRailAvatar(
+                            account: account,
+                            projectedUnread: session.accountScope?.attentionModel.unreadCount(
+                                accountIdHex: account.accountIdHex
+                            )
+                        )
                     }
                 }
                 .padding(.vertical, 4)
@@ -104,8 +111,13 @@ struct AccountRailView: View {
 private struct AccountRailAvatar: View {
     @Environment(WorkspaceState.self) private var workspace
     let account: AccountItem
+    let projectedUnread: Int?
 
-    private var unread: Int { workspace.unreadCount(forAccountIdHex: account.accountIdHex) }
+    private var unread: Int {
+        // Account attention is the sole badge authority. Before its initial complete snapshot,
+        // render no badge rather than reviving the legacy one-shot summary cache.
+        projectedUnread ?? 0
+    }
     private var isActive: Bool { account.id == workspace.activeAccountId }
 
     var body: some View {
@@ -146,6 +158,11 @@ private struct AccountRailAvatar: View {
 struct ChatListDrawerView: View {
     @Environment(WorkspaceState.self) private var workspace
     @Environment(\.locale) private var locale
+    let model: ChatListViewModel?
+
+    init(model: ChatListViewModel? = nil) {
+        self.model = model
+    }
 
     private var isShowingSettings: Bool {
         if case .settings = workspace.selection { return true }
@@ -190,6 +207,16 @@ struct ChatListDrawerView: View {
                                 isCollapsed: isCollapsed,
                                 searchResult: workspace.sidebarMessageSearchResult(for: chat)
                             )
+                            .onAppear {
+                                guard filter == .active else { return }
+                                model?.setVisibleWindowAnchor(groupIdHex: chat.id)
+                                if chat.id == visibleChats.last?.id {
+                                    Task { await model?.pageWindow(.forward) }
+                                }
+                                if chat.id == visibleChats.first?.id {
+                                    Task { await model?.pageWindow(.backward) }
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal, 8)
@@ -216,6 +243,8 @@ struct ChatListDrawerView: View {
                                 ArchivedEmptyDrawerState()
                             case .unread:
                                 UnreadEmptyDrawerState()
+                            case .left:
+                                LeftEmptyDrawerState()
                             case .active:
                                 // An account with no chats at all is told so by the detail
                                 // pane, which has room for the invitation to start one and
@@ -242,13 +271,32 @@ struct ChatListDrawerView: View {
 extension ChatListDrawerView {
     fileprivate func visibleChats(for filter: ChatListFilter) -> [ChatItem] {
         let chats: [ChatItem]
+        let useBoundedWindow = workspace.searchText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        let activeChats =
+            model?.chats(
+                view: .chats,
+                nicknames: workspace.activeContactNicknames,
+                useWindow: useBoundedWindow
+            )
+            ?? workspace.activeChats
+        let archivedChats =
+            model?.chats(view: .archived, nicknames: workspace.activeContactNicknames)
+            ?? workspace.archivedChats
         switch filter {
         case .active:
-            chats = workspace.activeChats
+            chats = activeChats.filter { !$0.isNoLongerMember }
         case .unread:
-            chats = workspace.activeChats.filter(\.hasUnread)
+            chats =
+                model?.chats(view: .unread, nicknames: workspace.activeContactNicknames)
+                ?? activeChats.filter { $0.hasUnread && !$0.isNoLongerMember }
         case .archived:
-            chats = workspace.archivedChats
+            chats = archivedChats
+        case .left:
+            chats =
+                model?.chats(view: .left, nicknames: workspace.activeContactNicknames)
+                ?? (activeChats + archivedChats).filter(\.isNoLongerMember)
         }
         return workspace.sidebarSearchFilteredChats(chats)
     }
@@ -449,6 +497,18 @@ private struct UnreadEmptyDrawerState: View {
     var body: some View {
         WNEmptyStateView(title: L10n.string("No unread chats", locale: locale), systemImage: "bubble.left")
             .padding()
+    }
+}
+
+private struct LeftEmptyDrawerState: View {
+    @Environment(\.locale) private var locale
+
+    var body: some View {
+        WNEmptyStateView(
+            title: L10n.string("No chats", locale: locale),
+            systemImage: "rectangle.portrait.and.arrow.right"
+        )
+        .padding()
     }
 }
 

@@ -2,20 +2,15 @@
 //  KeyPackageSettingsView.swift
 //  whitenoise-mac
 //
-//  The Key Packages page: the KeyPackages this identity has published so other people
-//  can invite it.
-//
-//  A destination of Developer mode, not a drawer row: `wn-ios-prototype` reaches Key Packages
-//  from an isolated row inside Developer Tools and from nowhere else, so the chevron in the
-//  header is the way back and every row here can speak plainly to a developer — the detail
-//  that used to be gated on `developerMode` is unconditional, because the page cannot be
-//  opened with the toggle off.
+//  Local KeyPackage inventory and the relay history observed by an explicit refresh.
+//  MarmotKit owns lifecycle/provenance; this screen only formats the typed records.
 //
 
+import MarmotKit
 import SwiftUI
 
 struct KeyPackageSettingsView: View {
-    @Environment(WorkspaceState.self) private var workspace
+    let model: KeyPackageSettingsViewModel
 
     var body: some View {
         SettingsScaffold(
@@ -26,27 +21,14 @@ struct KeyPackageSettingsView: View {
             SettingsSection {
                 HStack(spacing: 10) {
                     Button {
-                        Task { await workspace.publishNewKeyPackage() }
+                        Task { await model.refresh() }
                     } label: {
-                        Label(
-                            workspace.isPublishingKeyPackage
-                                ? L10n.string("Publishing...") : L10n.string("Publish new"), systemImage: "plus.circle")
-                    }
-                    .nativeGlassProminentButtonStyle()
-                    .disabled(workspace.isPublishingKeyPackage || workspace.activeAccount == nil)
-
-                    Button {
-                        Task { await workspace.republishKeyPackage() }
-                    } label: {
-                        Label(
-                            workspace.isRepublishingKeyPackage
-                                ? L10n.string("Republishing...") : L10n.string("Republish latest"),
-                            systemImage: "arrow.triangle.2.circlepath")
+                        Label(L10n.string("Refresh"), systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.wnSecondary)
-                    .disabled(workspace.isRepublishingKeyPackage || workspace.activeAccount == nil)
+                    .disabled(model.isRefreshing)
 
-                    if workspace.isLoadingSettings {
+                    if model.isRefreshing {
                         ProgressView()
                             .controlSize(.small)
                     }
@@ -55,31 +37,44 @@ struct KeyPackageSettingsView: View {
                 }
             }
 
-            SettingsSection(title: L10n.string("Published Key Packages")) {
-                if workspace.keyPackages.isEmpty {
-                    ContentUnavailableView("No key packages", systemImage: "key.slash")
-                        .frame(minHeight: 220)
+            SettingsSection(title: L10n.string("Key Packages")) {
+                if model.isLoading && model.inventory.isEmpty {
+                    ProgressView()
+                        .frame(maxWidth: .infinity, minHeight: 120)
+                } else if model.inventory.isEmpty {
+                    ContentUnavailableView(L10n.string("No key packages"), systemImage: "key.slash")
+                        .frame(minHeight: 180)
                 } else {
-                    ForEach(workspace.keyPackages) { package in
-                        KeyPackageRow(package: package) {
-                            Task { await workspace.deleteKeyPackage(package) }
-                        }
-                        .disabled(workspace.deletingKeyPackageId == package.id)
+                    ForEach(model.inventory, id: \.stableDisplayID) { entry in
+                        KeyPackageInventoryRow(entry: entry)
                     }
                 }
             }
 
+            SettingsSection(title: L10n.string("Relay Event History")) {
+                if model.relayEvents.isEmpty {
+                    ContentUnavailableView(L10n.string("No key packages"), systemImage: "clock.arrow.circlepath")
+                        .frame(minHeight: 140)
+                } else {
+                    ForEach(model.relayEvents, id: \.eventIdHex) { event in
+                        KeyPackageRelayEventRow(event: event)
+                    }
+                }
+            }
+
+            if let error = model.error {
+                Text(error.message)
+                    .foregroundStyle(WNColor.backgroundContentDestructive)
+            }
         }
-        .task(id: workspace.activeAccountId) {
-            await workspace.loadKeyPackages()
+        .task {
+            await model.loadLocalInventory()
         }
     }
 }
 
-struct KeyPackageRow: View {
-    @Environment(WorkspaceState.self) private var workspace
-    let package: KeyPackageItem
-    let delete: () -> Void
+struct KeyPackageInventoryRow: View {
+    let entry: AccountKeyPackageInventoryEntryFfi
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -93,82 +88,90 @@ struct KeyPackageRow: View {
                     }
 
                 VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 8) {
-                        if package.isLocal {
-                            statusBadge(
-                                L10n.string("Local"),
-                                systemImage: "macbook",
-                                tint: MessagesPalette.sentBubble
-                            )
-                        }
-                        if package.isRelayDiscovered {
-                            statusBadge(
-                                L10n.string("Synced"),
-                                systemImage: "checkmark.icloud.fill",
-                                tint: .green
-                            )
-                        }
-                        if !package.isLocal && !package.isRelayDiscovered {
-                            statusBadge(
-                                L10n.string("Unknown"),
-                                systemImage: "questionmark.circle",
-                                tint: .secondary
-                            )
-                        }
-                        Text(package.publishedLabel)
-                            .wnFont(.medium10)
-                            .foregroundStyle(WNColor.backgroundContentSecondary)
-                    }
-
-                    keyValue(L10n.string("Event"), package.eventIdHex)
-                    keyValue("KeyPackageRef", package.keyPackageRefHex)
-                    keyValue(L10n.string("Slot"), package.keyPackageId)
-                    Text(L10n.plural("%llu bytes", package.keyPackageBytes))
-                        .wnFont(.medium10.monospacedDigit())
-                        .foregroundStyle(WNColor.backgroundContentSecondary)
+                    KeyPackageStateBadge(state: entry.localState)
+                    KeyPackageValueRow(title: L10n.string("Event"), value: entry.record.eventIdHex)
+                    KeyPackageValueRow(title: "KeyPackageRef", value: entry.record.keyPackageRefHex)
+                    KeyPackageValueRow(title: L10n.string("Slot"), value: entry.record.keyPackageId)
+                    Text(
+                        ByteCountFormatter.string(
+                            fromByteCount: Int64(clamping: entry.record.keyPackageBytes),
+                            countStyle: .file
+                        )
+                    )
+                    .wnFont(.medium10.monospacedDigit())
+                    .foregroundStyle(WNColor.backgroundContentSecondary)
                 }
 
                 Spacer()
-
-                Button(action: delete) {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(WNColor.backgroundContentDestructive)
-                .help(L10n.string("Delete key package"))
-                .disabled(package.eventIdHex.isEmpty || workspace.deletingKeyPackageId != nil)
             }
 
-            if !package.sourceRelays.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(L10n.string("Source relays"))
-                        .wnFont(.semiBold10)
-                        .foregroundStyle(WNColor.backgroundContentSecondary)
-                    ForEach(package.sourceRelays, id: \.self) { relay in
-                        Text(relay)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(WNColor.backgroundContentSecondary)
-                            .textSelection(.enabled)
-                    }
-                }
-                .padding(.leading, 42)
+            if !entry.record.sourceRelays.isEmpty {
+                KeyPackageRelayList(relays: entry.record.sourceRelays)
+                    .padding(.leading, 42)
             }
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(String(format: L10n.string("%@, %@"), package.sourceLabel, package.publishedLabel))
+        .accessibilityLabel(entry.localState.accessibilityLabel)
     }
+}
 
-    private func statusBadge(_ title: String, systemImage: String, tint: Color) -> some View {
-        Label(title, systemImage: systemImage)
+struct KeyPackageRelayEventRow: View {
+    let event: AccountKeyPackageRelayEventFfi
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label(
+                    event.isCurrent ? L10n.string("Current") : L10n.string("Superseded"),
+                    systemImage: event.isCurrent ? "checkmark.circle.fill" : "clock.arrow.circlepath"
+                )
+                .wnFont(.semiBold10)
+                .foregroundStyle(event.isCurrent ? Color.green : WNColor.backgroundContentSecondary)
+
+                Text(KeyPackageDisplay.date(event.createdAt))
+                    .wnFont(.medium10)
+                    .foregroundStyle(WNColor.backgroundContentSecondary)
+            }
+
+            KeyPackageValueRow(title: L10n.string("Event"), value: event.eventIdHex)
+            KeyPackageValueRow(title: "KeyPackageRef", value: event.keyPackageRefHex)
+            Text(
+                ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: event.keyPackageBytes),
+                    countStyle: .file
+                )
+            )
+            .wnFont(.medium10.monospacedDigit())
+            .foregroundStyle(WNColor.backgroundContentSecondary)
+
+            if !event.sourceRelays.isEmpty {
+                KeyPackageRelayList(relays: event.sourceRelays)
+            }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct KeyPackageStateBadge: View {
+    let state: AccountKeyPackageLocalStateFfi
+
+    var body: some View {
+        Label(state.displayLabel, systemImage: state.symbol)
             .wnFont(.semiBold10)
-            .foregroundStyle(tint)
+            .foregroundStyle(state.tint)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
-            .background(tint.opacity(0.12), in: Capsule())
+            .background(state.tint.opacity(0.12), in: Capsule())
     }
+}
 
-    private func keyValue(_ title: String, _ value: String) -> some View {
+struct KeyPackageValueRow: View {
+    let title: String
+    let value: String
+
+    var body: some View {
         HStack(spacing: 6) {
             Text(title)
                 .wnFont(.semiBold10)
@@ -179,4 +182,114 @@ struct KeyPackageRow: View {
                 .textSelection(.enabled)
         }
     }
+}
+
+struct KeyPackageRelayList: View {
+    let relays: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(L10n.string("Source relays"))
+                .wnFont(.semiBold10)
+                .foregroundStyle(WNColor.backgroundContentSecondary)
+            ForEach(relays, id: \.self) { relay in
+                Text(relay)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(WNColor.backgroundContentSecondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+}
+
+private enum KeyPackageDisplay {
+    static func date(_ timestamp: UInt64) -> String {
+        Date(timeIntervalSince1970: TimeInterval(Int64(clamping: timestamp)))
+            .formatted(date: .abbreviated, time: .shortened)
+    }
+}
+
+private extension AccountKeyPackageInventoryEntryFfi {
+    var stableDisplayID: String {
+        [record.keyPackageRefHex, record.eventIdHex, record.keyPackageId].joined(separator: ":")
+    }
+}
+
+private extension AccountKeyPackageLocalStateFfi {
+    var displayLabel: String {
+        switch self {
+        case .notLocal: L10n.string("Observed on relays")
+        case .current: L10n.string("Current on this device")
+        case .pendingReplacement: L10n.string("Pending replacement on this device")
+        case .retainedPrivateMaterial: L10n.string("Retained on this device")
+        case .otherOwned: L10n.string("Owned by this device")
+        }
+    }
+
+    var accessibilityLabel: String { displayLabel }
+
+    var symbol: String {
+        switch self {
+        case .notLocal: "checkmark.icloud.fill"
+        case .current: "macbook"
+        case .pendingReplacement: "arrow.triangle.2.circlepath"
+        case .retainedPrivateMaterial: "archivebox.fill"
+        case .otherOwned: "key.fill"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .notLocal: .green
+        case .current: MessagesPalette.sentBubble
+        case .pendingReplacement: .orange
+        case .retainedPrivateMaterial, .otherOwned: WNColor.backgroundContentSecondary
+        }
+    }
+}
+
+#Preview("Key Packages") {
+    KeyPackageSettingsView(model: .preview())
+        .environment(WorkspaceState.preview())
+        .frame(width: 760, height: 640)
+}
+
+#Preview("Key Package Inventory Row") {
+    KeyPackageInventoryRow(
+        entry: AccountKeyPackageInventoryEntryFfi(record: .preview, localState: .current)
+    )
+    .padding()
+    .frame(width: 520)
+}
+
+#Preview("Key Package Relay Event") {
+    KeyPackageRelayEventRow(
+        event: AccountKeyPackageRelayEventFfi(
+            accountIdHex: "abcdef",
+            keyPackageId: "slot-1",
+            keyPackageRefHex: "0123456789abcdef",
+            eventIdHex: "fedcba9876543210",
+            createdAt: 1_700_000_000,
+            keyPackageBytes: 512,
+            sourceRelays: ["wss://relay.example.com"],
+            isCurrent: true
+        )
+    )
+    .padding()
+    .frame(width: 520)
+}
+
+private extension AccountKeyPackageFfi {
+    static let preview = AccountKeyPackageFfi(
+        accountRef: "preview",
+        accountIdHex: "abcdef",
+        keyPackageId: "slot-1",
+        keyPackageRefHex: "0123456789abcdef",
+        eventIdHex: "fedcba9876543210",
+        publishedAt: 1_700_000_000,
+        keyPackageBytes: 512,
+        sourceRelays: ["wss://relay.example.com"],
+        local: true,
+        relay: true
+    )
 }

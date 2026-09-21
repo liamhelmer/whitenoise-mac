@@ -305,7 +305,9 @@ extension WorkspaceState {
         groupIdHex: String,
         account: AccountItem,
         client: any MarmotRuntime,
-        owner: TimelineWindowOwner
+        owner: TimelineWindowOwner?,
+        preparedSenderProfiles: [String: ChatPeerProfile]? = nil,
+        projectedClientTokens: Set<String>? = nil
     ) async {
         guard
             canApplyTimelineWindow(
@@ -314,15 +316,20 @@ extension WorkspaceState {
                 owner: owner
             )
         else { return }
-        let senderProfiles = await TimelineSignpost.mapping.asyncInterval(
-            "resolveSenders.window", count: page.messages.count
-        ) {
-            await messageSenderProfiles(
-                from: page.messages,
-                groupIdHex: groupIdHex,
-                activeAccount: account,
-                client: client
-            )
+        let senderProfiles: [String: ChatPeerProfile]
+        if let preparedSenderProfiles {
+            senderProfiles = preparedSenderProfiles
+        } else {
+            senderProfiles = await TimelineSignpost.mapping.asyncInterval(
+                "resolveSenders.window", count: page.messages.count
+            ) {
+                await messageSenderProfiles(
+                    from: page.messages,
+                    groupIdHex: groupIdHex,
+                    activeAccount: account,
+                    client: client
+                )
+            }
         }
         let mentionNames = cachedMentionNames(groupIdHex: groupIdHex)
         guard
@@ -390,6 +397,57 @@ extension WorkspaceState {
         }
         if didChangeMediaAttachments {
             clearMediaReferenceResolutionCache(forAccountId: account.id, groupIdHex: groupIdHex)
+        }
+        if let projectedClientTokens,
+            !projectedClientTokens.isEmpty,
+            let draftKey = selectedComposerDraftKey,
+            draftKey.accountId == account.id,
+            draftKey.chatId == groupIdHex
+        {
+            let pending = pendingOutgoingTextMessagesByConversation[draftKey] ?? []
+            let reconciledIds = pending.compactMap { message in
+                projectedClientTokens.contains(message.clientToken) ? message.id : nil
+            }
+            if !reconciledIds.isEmpty {
+                let reconciled = Set(reconciledIds)
+                for id in reconciled {
+                    pendingOutgoingTextSendTasks.removeValue(forKey: id)?.cancel()
+                }
+                let remaining = pending.filter { !reconciled.contains($0.id) }
+                pendingOutgoingTextMessagesByConversation[draftKey] = remaining.isEmpty ? nil : remaining
+            }
+            let pendingMedia = pendingOutgoingMediaMessagesByConversation[draftKey] ?? []
+            let reconciledMediaIds = Set(
+                pendingMedia.compactMap { message in
+                    projectedClientTokens.contains(message.clientToken) ? message.id : nil
+                })
+            if !reconciledMediaIds.isEmpty {
+                // Prime the projected row from the plaintext still owned by its optimistic
+                // message before removing that message. The encrypted disk cache is durable but
+                // asynchronous; without this handoff, the first frame would regress to a spinner.
+                for pendingMessage in pendingMedia where reconciledMediaIds.contains(pendingMessage.id) {
+                    guard
+                        let record = page.messages.first(where: {
+                            $0.clientToken == pendingMessage.clientToken
+                        }),
+                        let projectedMessage = visibleMessages.first(where: {
+                            $0.id == record.messageIdHex
+                        })
+                    else { continue }
+                    for attachment in projectedMessage.mediaAttachments where attachment.rejectionKind == nil {
+                        _ = mediaDownloadStateStore(
+                            for: projectedMessage,
+                            attachment: attachment
+                        )
+                    }
+                }
+                for id in reconciledMediaIds {
+                    pendingOutgoingMediaSendTasks.removeValue(forKey: id)?.cancel()
+                    pendingOutgoingMediaUploadTasks.removeValue(forKey: id)?.forEach { $0.cancel() }
+                }
+                let remaining = pendingMedia.filter { !reconciledMediaIds.contains($0.id) }
+                pendingOutgoingMediaMessagesByConversation[draftKey] = remaining.isEmpty ? nil : remaining
+            }
         }
         await markLatestVisibleMessageRead(groupIdHex: groupIdHex, account: account, client: client)
     }
@@ -786,11 +844,31 @@ extension WorkspaceState {
         defer { isForwardingMessages = false }
         do {
             for message in messages {
-                _ = try await client.sendText(
-                    accountRef: activeAccount.accountRef,
-                    groupIdHex: chat.id,
-                    text: message.wireBody
-                )
+                let clientToken = UUID().uuidString.lowercased()
+                do {
+                    _ = try await client.sendTextWithClientToken(
+                        accountRef: activeAccount.accountRef,
+                        groupIdHex: chat.id,
+                        text: message.wireBody,
+                        clientToken: clientToken
+                    )
+                } catch {
+                    // A cancelled host await can race durable local admission. Resolve that
+                    // ambiguity with the same token instead of creating a duplicate forward.
+                    if let status = try? client.localSendStatus(
+                        accountRef: activeAccount.accountRef,
+                        groupIdHex: chat.id,
+                        clientToken: clientToken
+                    ) {
+                        switch status {
+                        case .queued, .engineOwned, .completed:
+                            continue
+                        case .rejected:
+                            break
+                        }
+                    }
+                    throw error
+                }
             }
             cancelForwarding()
             cancelMessageSelection()
@@ -1149,10 +1227,9 @@ extension WorkspaceState {
 
     /// Moves a media draft out of the composer and into a pending outgoing message, then returns.
     ///
-    /// The uploads staging started are *detached* rather than cancelled: the composer clear that
-    /// follows would otherwise kill the very transfers the new bubble is about to wait on. An
-    /// attachment whose upload already finished contributes its reference directly, and one whose
-    /// upload failed contributes nothing — the send re-uploads it.
+    /// The uploads staging started are detached long enough to transfer their cancellation
+    /// ownership to the pending send. That send cancels them when MarmotKit's atomic retained-media
+    /// operation starts, so preview work cannot become a second authoritative upload.
     private func handOffMediaSend(
         _ mediaAttachments: [PendingMediaAttachment],
         caption: String,
@@ -1464,7 +1541,8 @@ extension WorkspaceState {
                 groupIdHex: groupIdHex,
                 account: account,
                 client: client,
-                owner: owner
+                owner: owner,
+                projectedClientTokens: Set(page.messages.compactMap(\.clientToken))
             )
         } catch {
             guard

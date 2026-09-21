@@ -12,6 +12,7 @@
 import AVFoundation
 import AppKit
 import ImageIO
+import MarmotKit
 import SwiftUI
 
 struct ComposerEmojiInsertion: Equatable {
@@ -1858,11 +1859,17 @@ struct MessageInfoSheet: View {
 struct MessageForwardSheet: View {
     @Environment(WorkspaceState.self) private var workspace
     @State private var query = ""
+    let chatListModel: ChatListViewModel
 
     var body: some View {
-        let targets = workspace.activeChats.filter { chat in
+        let projectedChats = chatListModel.chats(
+            view: .chats,
+            nicknames: workspace.activeContactNicknames,
+            useWindow: false
+        )
+        let targets = projectedChats.filter { chat in
             let searchMatches = query.isEmpty || chat.title.localizedCaseInsensitiveContains(query)
-            return chat.canUseComposer && searchMatches
+            return chat.canUseComposer && !chat.isBlockedDirectPeer && searchMatches
         }
 
         VStack(spacing: 0) {
