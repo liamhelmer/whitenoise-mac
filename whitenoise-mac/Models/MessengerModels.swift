@@ -716,6 +716,23 @@ nonisolated enum MessageMediaKind: Hashable, Sendable {
 nonisolated struct MessageMediaAttachment: Identifiable, Hashable {
     let id: String
     let reference: MediaAttachmentReferenceFfi
+    var rejection: MediaAttachmentRejectionFfi? = nil
+
+    static func rejected(
+        messageIdHex: String,
+        attachmentIndex: Int,
+        rejection: MediaAttachmentRejectionFfi
+    ) -> Self {
+        Self(
+            id: "\(messageIdHex)#rejected-\(attachmentIndex)",
+            reference: MediaAttachmentReferenceFfi(
+                locators: [], ciphertextSha256: "", plaintextSha256: "", nonceHex: "",
+                fileName: L10n.string("Attachment"), mediaType: "application/octet-stream",
+                version: .v1, sourceEpoch: 0, dim: nil, thumbhash: nil
+            ),
+            rejection: rejection
+        )
+    }
 
     var fileName: String {
         reference.fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

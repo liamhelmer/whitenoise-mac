@@ -343,6 +343,12 @@ extension WorkspaceState {
                         )
                     else { return }
 
+                    let replacements = update.updatedResults.compactMap(UserDiscoveryRanking.person)
+                    if !replacements.isEmpty {
+                        let replacedAccountIds = Set(replacements.map(\.accountIdHex))
+                        aggregate.removeAll { replacedAccountIds.contains($0.accountIdHex) }
+                        aggregate.append(contentsOf: replacements)
+                    }
                     aggregate.append(contentsOf: update.newResults.compactMap(UserDiscoveryRanking.person))
                     self.discoveredPeople = UserDiscoveryRanking.sortedUnique(aggregate)
                     self.discoveryResultsQuery = query
@@ -392,7 +398,7 @@ extension WorkspaceState {
             return false
         case .searchCompleted:
             return true
-        case .radiusStarted, .resultsFound, .discoveryResultsFound, .radiusCompleted:
+        case .radiusStarted, .resultsFound, .discoveryResultsFound, .cachedResultsFound, .radiusCompleted:
             return false
         }
     }

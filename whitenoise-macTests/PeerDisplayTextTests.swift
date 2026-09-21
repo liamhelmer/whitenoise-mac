@@ -319,11 +319,15 @@ private func timelineMessage(
 private func groupSystemEvent(
     systemType: String,
     text: String,
+    provenance: GroupSystemEventProvenanceFfi = .authenticatedGroupState,
     actorAccountIdHex: String? = nil,
     name: String? = nil,
     oldName: String? = nil
 ) -> GroupSystemEventFfi {
     GroupSystemEventFfi(
+        provenance: provenance,
+        actorDisplayName: nil,
+        subjectDisplayName: nil,
         systemType: systemType,
         text: text,
         actorAccountIdHex: actorAccountIdHex,

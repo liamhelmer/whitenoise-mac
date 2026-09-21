@@ -53,7 +53,7 @@ final class WorkspaceState {
         let buildConfig: TelemetryBuildConfig
         let accountLabel: String?
         let relayTelemetryRuntimeConfig: RelayTelemetryRuntimeConfigFfi
-        let auditLogTrackerConfig: AuditLogTrackerConfigFfi
+        let auditLogTrackerConfig: AuditLogTrackerConfigV4Ffi
     }
 
     struct FilteredChatsCache {

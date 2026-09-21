@@ -506,6 +506,9 @@ nonisolated extension MessageItem {
         senderProfiles: [String: ChatPeerProfile]
     ) -> String? {
         guard let event else { return nil }
+        guard event.provenance == .authenticatedGroupState else {
+            return PeerDisplayText.sanitize(event.text)
+        }
         switch event.systemType {
         case "member_added":
             if let text = memberAddedText(
@@ -1189,19 +1192,38 @@ private nonisolated enum MessageMediaParser {
     private static let logger = Logger(subsystem: "com.whitenoise.media", category: "MessageMediaParser")
 
     static func attachments(
-        resolvedMedia: [MediaAttachmentReferenceFfi],
+        resolvedMedia: [MediaAttachmentOutcomeFfi],
         mediaJson: String?,
         tags: [MessageTagFfi],
         messageIdHex: String
     ) -> [MessageMediaAttachment] {
         // Prefer the core's already-resolved and validated media references
         // (`TimelineMessageRecordFfi.media`): they use the same resolution as
-        // `list_media`, with malformed `imeta` attachments already dropped. Fall
+        // `list_media`; malformed `imeta` attachments arrive as rejected outcomes and
+        // are excluded from the downloadable attachment list here. Fall
         // back to local parsing only for records that predate FFI media resolution
         // (e.g. an empty `media` list paired with a populated `mediaJson`).
-        let resolvedReferences: [MediaAttachmentReferenceFfi]
+        let resolvedAttachments: [MessageMediaAttachment]
         if !resolvedMedia.isEmpty {
-            resolvedReferences = resolvedMedia
+            resolvedAttachments = resolvedMedia.map { outcome in
+                switch outcome {
+                case .accepted(let attachmentIndex, let reference):
+                    return MessageMediaAttachment(
+                        id: mediaAttachmentId(
+                            messageIdHex: messageIdHex,
+                            reference: reference,
+                            index: Int(attachmentIndex)
+                        ),
+                        reference: reference
+                    )
+                case .rejected(let attachmentIndex, let rejection):
+                    return MessageMediaAttachment.rejected(
+                        messageIdHex: messageIdHex,
+                        attachmentIndex: Int(attachmentIndex),
+                        rejection: rejection
+                    )
+                }
+            }
         } else {
             let tagReferences = references(fromIMetaTags: tags)
             let jsonReferences = references(fromMediaJson: mediaJson)
@@ -1210,15 +1232,15 @@ private nonisolated enum MessageMediaParser {
             if fallbackReferences.wasTruncated {
                 logFallbackOverflow()
             }
-            resolvedReferences = fallbackReferences.references
+            resolvedAttachments = fallbackReferences.references.enumerated().map { index, reference in
+                MessageMediaAttachment(
+                    id: mediaAttachmentId(messageIdHex: messageIdHex, reference: reference, index: index),
+                    reference: reference
+                )
+            }
         }
 
-        return resolvedReferences.enumerated().map { index, reference in
-            MessageMediaAttachment(
-                id: mediaAttachmentId(messageIdHex: messageIdHex, reference: reference, index: index),
-                reference: reference
-            )
-        }
+        return resolvedAttachments
     }
 
     private struct FallbackReferenceParseResult {

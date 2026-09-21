@@ -637,7 +637,7 @@ nonisolated final class FakeMarmotRuntime: MarmotRuntime, @unchecked Sendable {
         exportIntervalSeconds: 60
     )
     private(set) var localNotificationsEnabledSet: Bool?
-    private(set) var auditLogTrackerConfig: AuditLogTrackerConfigFfi?
+    private(set) var auditLogTrackerConfig: AuditLogTrackerConfigV4Ffi?
     private(set) var auditLogTrackerConfigSetCallCount = 0
     private(set) var deletedAuditLogFilePaths: [String] = []
     private(set) var didPostAuditLogTrackerUpdate = false
@@ -1205,7 +1205,7 @@ nonisolated final class FakeMarmotRuntime: MarmotRuntime, @unchecked Sendable {
         return storedAuditLogSettings
     }
 
-    func setAuditLogTrackerConfig(config: AuditLogTrackerConfigFfi) throws -> AuditLogTrackerConfigFfi {
+    func setAuditLogTrackerConfig(config: AuditLogTrackerConfigV4Ffi) throws -> AuditLogTrackerConfigV4Ffi {
         auditLogTrackerConfigSetCallCount += 1
         recordSyncCall("setAuditLogTrackerConfig")
         auditLogTrackerConfig = config

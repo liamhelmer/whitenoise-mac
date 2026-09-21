@@ -61,12 +61,14 @@ func searchResult(
     matchQuality: MatchQualityFfi = .exact,
     providerRank: Double? = nil,
     displayName: String? = nil,
-    picture: String? = nil
+    picture: String? = nil,
+    isFollowedBySearcher: Bool = false
 ) -> UserDirectorySearchResultFfi {
     UserDirectorySearchResultFfi(
         accountIdHex: discoveryHex(seed),
         npub: "npub1\(seed.prefix(8))",
         radius: radius,
+        isFollowedBySearcher: isFollowedBySearcher,
         matchedField: matchedField,
         matchQuality: matchQuality,
         providerRank: providerRank,
@@ -83,11 +85,13 @@ func searchResult(
 
 func userSearchUpdate(
     _ trigger: SearchUpdateTriggerFfi,
-    _ results: [UserDirectorySearchResultFfi]
+    _ results: [UserDirectorySearchResultFfi],
+    updatedResults: [UserDirectorySearchResultFfi] = []
 ) -> UserSearchUpdateFfi {
     UserSearchUpdateFfi(
         trigger: trigger,
         newResults: results,
+        updatedResults: updatedResults,
         totalResultCount: UInt32(results.count)
     )
 }
@@ -721,6 +725,7 @@ func projectedTimeline(from messages: [AppMessageRecordFfi]) -> TimelinePageFfi 
                         media: [],
                         agentTextStreamJson: nil,
                         deleted: false,
+                        deletionSource: .unknown,
                         invalidationStatus: nil
                     )
                 }
@@ -822,6 +827,7 @@ func timelineMessage(
     recordedAt: UInt64,
     mediaJson: String? = nil,
     media: [MediaAttachmentReferenceFfi] = [],
+    mediaOutcomes: [MediaAttachmentOutcomeFfi]? = nil,
     agentTextStreamJson: String? = nil,
     groupSystem: GroupSystemEventFfi? = nil,
     replyToMessageIdHex: String? = nil,
@@ -832,8 +838,13 @@ func timelineMessage(
     invalidationStatus: String? = nil
 ) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi(
+        clientToken: nil,
+        hasReports: false,
         messageIdHex: id,
         sourceMessageIdHex: sourceMessageIdHex,
+        sourceEpoch: nil,
+        retentionSeconds: nil,
+        retentionExpiresAt: nil,
         direction: direction,
         groupIdHex: groupIdHex,
         sender: sender,
@@ -846,11 +857,16 @@ func timelineMessage(
         replyToMessageIdHex: replyToMessageIdHex,
         replyPreview: replyPreview,
         mediaJson: mediaJson,
-        media: media,
+        media: mediaOutcomes
+            ?? media.enumerated().map { index, reference in
+                .accepted(attachmentIndex: UInt32(index), reference: reference)
+            },
         agentTextStreamJson: agentTextStreamJson,
         groupSystem: groupSystem,
         reactions: reactions,
+        edit: nil,
         deleted: deleted,
+        deletionSource: .unknown,
         deletedByMessageIdHex: nil,
         invalidationStatus: invalidationStatus
     )
@@ -867,6 +883,9 @@ func groupSystemEvent(
     newRetentionSeconds: UInt64? = nil
 ) -> GroupSystemEventFfi {
     GroupSystemEventFfi(
+        provenance: .memberAuthored,
+        actorDisplayName: nil,
+        subjectDisplayName: nil,
         systemType: systemType,
         text: text,
         actorAccountIdHex: actorAccountIdHex,
@@ -903,6 +922,7 @@ func chatListRow(
         avatarUrl: nil,
         avatar: nil,
         lastMessage: ChatListMessagePreviewFfi(
+            groupSystem: nil,
             messageIdHex: "preview",
             sender: sender,
             senderDisplayName: nil,
@@ -910,7 +930,10 @@ func chatListRow(
             contentTokens: emptyMarkdownDocument(),
             kind: kind,
             timelineAt: timelineAt,
+            retentionSeconds: nil,
+            retentionExpiresAt: nil,
             deleted: deleted,
+            deletionSource: .unknown,
             attachmentKind: attachmentKind,
             attachmentCount: attachmentCount,
             deliveryState: .notApplicable

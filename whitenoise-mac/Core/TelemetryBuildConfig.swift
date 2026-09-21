@@ -104,15 +104,15 @@ struct TelemetryBuildConfig: Equatable {
         )
     }
 
-    func auditTrackerConfig() -> AuditLogTrackerConfigFfi {
+    func auditTrackerConfig() -> AuditLogTrackerConfigV4Ffi {
         // Account identity now lives in the JSONL source_context emitted by the
         // Marmot core (Goggles contract), so the host no longer supplies an
         // account label here.
-        AuditLogTrackerConfigFfi(
+        AuditLogTrackerConfigV4Ffi(
             endpoint: nil,
             authorizationBearerToken: auditLogBearerToken,
-            source: AuditLogUploadSourceFfi(
-                deviceLabel: deviceModelIdentifier,
+            source: AuditLogUploadSourceV4Ffi(
+                hardwareModel: deviceModelIdentifier,
                 platform: "macOS",
                 appVersion: serviceVersion
             )

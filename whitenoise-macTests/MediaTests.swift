@@ -2305,6 +2305,48 @@ struct MediaTests: WorkspaceTestSupport {
     }
 
     @MainActor
+    @Test func rejectedResolvedMediaDoesNotRestoreUnvalidatedFallbackMedia() async throws {
+        // A non-empty outcome list means the core has already parsed the message's imeta tags.
+        // Rejected outcomes must not make the app fall back to its legacy parser and resurrect
+        // the same invalid attachment as downloadable media.
+        let accepted = mediaAttachmentReference(mediaType: "image/png", fileName: "accepted.png")
+        let fallback = mediaAttachmentReference(mediaType: "image/png", fileName: "fallback.png")
+        let page = TimelinePageFfi(
+            messages: [
+                timelineMessage(
+                    id: "mixed-media-outcomes",
+                    groupIdHex: "group",
+                    sender: "alice",
+                    plaintext: "",
+                    recordedAt: 1_700_000_000,
+                    mediaJson: mediaJSONString(fromJSONObject: [
+                        ["imeta": [mediaIMetaTag(for: fallback).values]]
+                    ]),
+                    mediaOutcomes: [
+                        .accepted(attachmentIndex: 0, reference: accepted),
+                        .rejected(
+                            attachmentIndex: 1,
+                            rejection: MediaAttachmentRejectionFfi(
+                                kind: .unsupportedFormat,
+                                detail: "unsupported attachment"
+                            )
+                        ),
+                    ]
+                )
+            ],
+            hasMoreBefore: false,
+            hasMoreAfter: false
+        )
+
+        let message = try #require(MessageItem.timeline(from: page, activeAccountIdHex: "self").first)
+
+        #expect(message.mediaAttachments.count == 2)
+        #expect(message.mediaAttachments[0].reference.fileName == "accepted.png")
+        #expect(message.mediaAttachments[0].rejection == nil)
+        #expect(message.mediaAttachments[1].rejection?.kind == .unsupportedFormat)
+    }
+
+    @MainActor
     @Test func mediaOnlyChatPreviewShowsAttachmentLabelInsteadOfUnsupported() async throws {
         // Regression for whitenoise-mac#175: `ChatListMessagePreviewFfi` carries no media
         // payload, so a media-only chat message arrives with empty plaintext. The chat-list

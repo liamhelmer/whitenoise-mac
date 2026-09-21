@@ -4968,6 +4968,33 @@ struct GroupsTests: WorkspaceTestSupport {
     }
 
     @MainActor
+    @Test func userDiscoveryReplacesAnExistingResultWhenMetadataIsUpdated() async throws {
+        let runtime = FakeMarmotRuntime(accounts: [discoverySearcherAccount])
+        runtime.userSearchUpdates = [
+            userSearchUpdate(
+                .cachedResultsFound,
+                [searchResult(hex: "b", radius: 2, displayName: "Cached")]
+            ),
+            userSearchUpdate(
+                .resultsFound(radius: 1),
+                [],
+                updatedResults: [searchResult(hex: "b", radius: 1, displayName: "Fresh")]
+            ),
+            userSearchUpdate(.searchCompleted, []),
+        ]
+        let state = WorkspaceState(clientFactory: { runtime })
+        await state.bootstrap()
+
+        state.newChatQuery = "al"
+        state.scheduleUserDiscovery()
+        #expect(await pollUserDiscovery(until: { !state.isSearchingPeople }))
+
+        #expect(state.discoveredPeople.count == 1)
+        #expect(state.discoveredPeople.first?.displayName == "Fresh")
+        #expect(state.discoveredPeople.first?.radius == 1)
+    }
+
+    @MainActor
     @Test func userDiscoveryDebounceCoalescesRapidKeystrokesIntoOneTraversal() async throws {
         let runtime = FakeMarmotRuntime(accounts: [discoverySearcherAccount])
         runtime.userSearchUpdates = [userSearchUpdate(.searchCompleted, [])]

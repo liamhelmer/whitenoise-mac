@@ -148,6 +148,7 @@ nonisolated extension ChatListMessagePreviewFfi {
         deleted: Bool
     ) {
         self.init(
+            groupSystem: nil,
             messageIdHex: messageIdHex,
             sender: sender,
             senderDisplayName: senderDisplayName,
@@ -155,7 +156,10 @@ nonisolated extension ChatListMessagePreviewFfi {
             contentTokens: contentTokens,
             kind: kind,
             timelineAt: timelineAt,
+            retentionSeconds: nil,
+            retentionExpiresAt: nil,
             deleted: deleted,
+            deletionSource: .unknown,
             attachmentKind: nil,
             attachmentCount: 0,
             deliveryState: .notApplicable
@@ -284,6 +288,8 @@ nonisolated extension TimelineMessageRecordFfi {
         invalidationStatus: String?
     ) {
         self.init(
+            clientToken: nil,
+            hasReports: false,
             messageIdHex: messageIdHex,
             sourceMessageIdHex: sourceMessageIdHex,
             sourceEpoch: nil,
@@ -301,11 +307,15 @@ nonisolated extension TimelineMessageRecordFfi {
             replyToMessageIdHex: replyToMessageIdHex,
             replyPreview: replyPreview,
             mediaJson: mediaJson,
-            media: media,
+            media: media.enumerated().map { index, reference in
+                .accepted(attachmentIndex: UInt32(index), reference: reference)
+            },
             agentTextStreamJson: agentTextStreamJson,
             groupSystem: groupSystem,
             reactions: reactions,
+            edit: nil,
             deleted: deleted,
+            deletionSource: .unknown,
             deletedByMessageIdHex: deletedByMessageIdHex,
             invalidationStatus: invalidationStatus
         )

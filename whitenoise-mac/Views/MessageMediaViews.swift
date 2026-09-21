@@ -11,6 +11,7 @@
 import AVFoundation
 import AVKit
 import AppKit
+import MarmotKit
 import SwiftUI
 
 /// Oversample factor applied to media thumbnails over their display-point size.
@@ -769,7 +770,7 @@ private struct AutomaticMediaDownloadModifier: ViewModifier {
     }
 
     private func startAutomaticDownloadIfNeeded() {
-        guard downloadState.shouldStartAutomaticDownload else { return }
+        guard attachment.rejection == nil, downloadState.shouldStartAutomaticDownload else { return }
         automaticDownloadTask?.cancel()
         automaticDownloadTask = Task {
             await workspace.loadMediaAttachment(attachment, for: message)
@@ -1068,7 +1069,17 @@ struct MessageMediaAttachmentView: View {
 
     var body: some View {
         Group {
-            switch downloadState.state {
+            if let rejection = attachment.rejection {
+                MessageAttachmentStatusRow(
+                    systemImage: rejection.kind == .unsupportedFormat
+                        ? "questionmark.square.dashed" : "exclamationmark.triangle",
+                    title: attachment.fileName,
+                    detail: L10n.string("Attachment unavailable"),
+                    isOutgoing: isOutgoing,
+                    isLoading: false
+                )
+            } else {
+                switch downloadState.state {
             case .idle, .loading:
                 // Audio keeps the player's shell while it downloads so the row does not reflow
                 // when the payload lands; every other kind still names the file it is fetching.
@@ -1107,6 +1118,7 @@ struct MessageMediaAttachmentView: View {
                         Task { await workspace.loadMediaAttachment(attachment, for: message) }
                     }
                 }
+            }
             }
         }
         .autoDownloadMediaAttachment(

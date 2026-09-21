@@ -368,7 +368,7 @@ extension WorkspaceState {
     /// `shouldEnrich: false` fast path and never trigger the per-row FFI fan-out.
     func chatListTriggerRequiresEnrichment(_ trigger: ChatListUpdateTriggerFfi) -> Bool {
         switch trigger {
-        case .newLastMessage, .lastMessageDeleted, .latestMessageDeliveryChanged,
+        case .newLastMessage, .lastMessageContentChanged, .lastMessageDeleted, .latestMessageDeliveryChanged,
             .pendingConfirmationChanged, .unreadChanged, .manualUnreadChanged, .muteChanged,
             .pinOrderChanged:
             return false
