@@ -262,6 +262,11 @@ extension WorkspaceState {
         pendingPeerProfileReprojectionIds.formUnion(ids)
         peerProfileReprojectionArrivals &+= 1
         peerProfileGeneration &+= 1
+        // Both mention projections bake published labels into value types. A newly resolved
+        // profile must therefore evict the old unnamed projection before the picker or a future
+        // timeline replacement reads it again.
+        mentionRosterCache.removeAll()
+        mentionNamesCache.removeAll()
 
         guard peerProfileReprojectionTask == nil else { return }
         let taskId = UUID()
@@ -372,6 +377,25 @@ extension WorkspaceState {
         client: any MarmotRuntime
     ) async {
         guard let groupIdHex = activeTimelineGroupId, selectedChat?.id == groupIdHex else { return }
+
+        // A mentioned person need not have authored a row in the current window. Upgrade those
+        // tokens directly from the roster before applying the sender-based replay guard below.
+        if let store = messageTimelineStores[groupIdHex] {
+            for member in groupMemberDetailsCache[groupIdHex] ?? []
+            where ids.contains(member.memberIdHex) && !member.npub.isEmpty {
+                let resolved = peerProfileFFICache[member.memberIdHex]?.resolved
+                _ = store.relabelMention(
+                    bech32: member.npub,
+                    name: member.nickname(from: activeContactNicknames)
+                        ?? MentionPublishedName.resolve(
+                            profileDisplayName: resolved?.profileDisplayName,
+                            profileName: resolved?.profileName,
+                            rosterDisplayName: member.displayName,
+                            directoryDisplayName: resolved?.directoryDisplayName
+                        )
+                )
+            }
+        }
 
         // Replay only when a resolved id is one the open window's rows actually name. Most
         // requests come from rosters and reaction lists — a 40-member group whose members

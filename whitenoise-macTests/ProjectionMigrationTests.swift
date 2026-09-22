@@ -176,6 +176,46 @@ struct ProjectionMigrationTests {
         #expect(profiles["peer"]?.imagePayload?.data == bytes)
     }
 
+    @Test func preparedConversationIdentitiesResolveMentionNpubsWithNicknameOverlay() {
+        let peerID = "peer-id"
+        let peerNpub = "npub1peer"
+        var snapshot = Self.conversationSnapshot(sequence: 1, title: "Conversation")
+        snapshot.identities = [
+            ConversationIdentityFfi(
+                accountIdHex: peerID,
+                displayName: "Published Alice",
+                avatar: .placeholder(stableSeed: peerID, source: .peerProfile),
+                hasCachedProfile: true,
+                avatarAsset: nil
+            )
+        ]
+        snapshot.messages = [
+            Self.conversationMessage(
+                timelineMessage(
+                    id: "mention",
+                    direction: "inbound",
+                    groupIdHex: "group",
+                    sender: "sender",
+                    plaintext: "Hello @\(peerNpub)",
+                    recordedAt: 1
+                ),
+                mentions: [peerID]
+            )
+        ]
+        let nicknames = ContactNicknames(
+            ownerAccountIdHex: AccountItem.samples[0].accountIdHex,
+            byContactIdHex: [peerID: "Mum"]
+        )
+
+        let names = snapshot.mentionNames(
+            activeAccount: AccountItem.samples[0],
+            nicknames: nicknames,
+            npubForAccountIdHex: { $0 == peerID ? peerNpub : nil }
+        )
+
+        #expect(names == [peerNpub: "Mum"])
+    }
+
     @Test func mediaOutcomesPreserveAcceptedAndRejectedAttachmentOrder() {
         let reference = MediaAttachmentReferenceFfi(
             locators: [],
@@ -1443,7 +1483,9 @@ struct ProjectionMigrationTests {
 
     private static func conversationMessage(
         _ record: TimelineMessageRecordFfi,
-        replyAuthor: String? = nil
+        replyAuthor: String? = nil,
+        mentions: [String] = [],
+        replyMentions: [String] = []
     ) -> ConversationMessageFfi {
         ConversationMessageFfi(
             timeline: record,
@@ -1451,9 +1493,9 @@ struct ProjectionMigrationTests {
                 messageIdHex: record.messageIdHex,
                 sender: record.sender,
                 replyAuthor: replyAuthor,
-                mentions: [],
+                mentions: mentions,
                 mentionsTruncated: false,
-                replyMentions: [],
+                replyMentions: replyMentions,
                 replyMentionsTruncated: false,
                 system: nil,
                 reactions: ConversationReactionsFfi(

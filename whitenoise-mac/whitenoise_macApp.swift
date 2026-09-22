@@ -152,6 +152,11 @@ struct whitenoise_macApp: App {
                 hasMoreBefore: snapshot.hasMoreBefore,
                 hasMoreAfter: snapshot.hasMoreAfter
             )
+            let mentionNames = snapshot.mentionNames(
+                activeAccount: account,
+                nicknames: workspace.activeContactNicknames,
+                npubForAccountIdHex: { runtime.npub(accountIdHex: $0) }
+            )
             await workspace.applyTimelineWindow(
                 page,
                 groupIdHex: model.groupIdHex,
@@ -163,6 +168,7 @@ struct whitenoise_macApp: App {
                     nicknames: workspace.activeContactNicknames,
                     avatarBytesByReference: avatarAssets?.bytesByReference ?? [:]
                 ),
+                preparedMentionNames: mentionNames,
                 projectedClientTokens: Set(timelineRecords.compactMap(\.clientToken))
             )
         }

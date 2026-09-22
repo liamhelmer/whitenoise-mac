@@ -694,7 +694,10 @@ private struct ConversationView: View {
         }
 
         if let context = composerMentionContext {
-            let candidates = workspace.mentionCandidates(matching: context.query)
+            let candidates = workspace.mentionCandidates(
+                matching: context.query,
+                projectedIdentities: model.snapshot?.identities ?? []
+            )
             if !candidates.isEmpty {
                 ComposerMentionPicker(candidates: candidates) { candidate in
                     guard let draftKey = workspace.selectedComposerDraftKey else { return }

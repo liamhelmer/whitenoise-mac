@@ -17,18 +17,45 @@ import MarmotKit
 
 @MainActor
 extension WorkspaceState {
-    func mentionRoster() -> [ComposerMentionCandidate] {
+    func mentionRoster(projectedIdentities: [ConversationIdentityFfi] = []) -> [ComposerMentionCandidate] {
         guard let selectedChat,
             let members = groupMemberDetailsCache[selectedChat.id]
         else { return [] }
+        // Profile resolution is observable even though the cache itself is intentionally not.
+        // Reading the generation makes an open picker rebuild when a late kind:0 arrives.
+        _ = peerProfileGeneration
         let stamp = contactNicknameStamp
-        if let cached = mentionRosterCache[selectedChat.id]?.value(at: stamp) { return cached }
+        if projectedIdentities.isEmpty,
+            let cached = mentionRosterCache[selectedChat.id]?.value(at: stamp)
+        {
+            return cached
+        }
 
         let nicknames = activeContactNicknames
+        let preparedNames = Dictionary(
+            projectedIdentities.compactMap { identity -> (String, String)? in
+                guard let name = PeerDisplayText.sanitize(identity.displayName) else { return nil }
+                return (identity.accountIdHex, name)
+            },
+            uniquingKeysWith: { _, latest in latest }
+        )
         let roster = members.filter { !$0.isSelf }.map { member in
-            ComposerMentionCandidate(details: member, nickname: member.nickname(from: nicknames))
+            let resolved = peerProfileFFICache[member.memberIdHex]?.resolved
+            return ComposerMentionCandidate(
+                details: member,
+                nickname: member.nickname(from: nicknames),
+                projectedDisplayName: preparedNames[member.memberIdHex]
+                    ?? MentionPublishedName.resolve(
+                        profileDisplayName: resolved?.profileDisplayName,
+                        profileName: resolved?.profileName,
+                        rosterDisplayName: member.displayName,
+                        directoryDisplayName: resolved?.directoryDisplayName
+                    )
+            )
         }
-        mentionRosterCache[selectedChat.id] = NicknameStamped(stamp: stamp, value: roster)
+        if projectedIdentities.isEmpty {
+            mentionRosterCache[selectedChat.id] = NicknameStamped(stamp: stamp, value: roster)
+        }
         #if DEBUG
             mentionRosterBuildCount += 1
         #endif
@@ -36,8 +63,14 @@ extension WorkspaceState {
     }
 
     /// The candidates the picker should show for an active `@query`, capped and boundary-filtered.
-    func mentionCandidates(matching query: String) -> [ComposerMentionCandidate] {
-        ComposerMentionQuery.filter(mentionRoster(), matching: query)
+    func mentionCandidates(
+        matching query: String,
+        projectedIdentities: [ConversationIdentityFfi] = []
+    ) -> [ComposerMentionCandidate] {
+        ComposerMentionQuery.filter(
+            mentionRoster(projectedIdentities: projectedIdentities),
+            matching: query
+        )
     }
 
     func ensureMentionRosterLoaded() {
@@ -70,7 +103,19 @@ extension WorkspaceState {
 
         let names = Self.mentionNames(
             from: groupMemberDetailsCache[groupIdHex] ?? [],
-            nicknames: activeContactNicknames
+            nicknames: activeContactNicknames,
+            projectedNamesByAccountID: Dictionary(
+                (groupMemberDetailsCache[groupIdHex] ?? []).compactMap { member in
+                    let resolved = peerProfileFFICache[member.memberIdHex]?.resolved
+                    return MentionPublishedName.resolve(
+                        profileDisplayName: resolved?.profileDisplayName,
+                        profileName: resolved?.profileName,
+                        rosterDisplayName: member.displayName,
+                        directoryDisplayName: resolved?.directoryDisplayName
+                    ).map { (member.memberIdHex, $0) }
+                },
+                uniquingKeysWith: { _, latest in latest }
+            )
         )
         mentionNamesCache[groupIdHex] = NicknameStamped(stamp: stamp, value: names)
         #if DEBUG
@@ -84,11 +129,14 @@ extension WorkspaceState {
     /// a member who published none, who would otherwise render as truncated bech32.
     nonisolated static func mentionNames(
         from members: [GroupMemberDetailsFfi],
-        nicknames: ContactNicknames
+        nicknames: ContactNicknames,
+        projectedNamesByAccountID: [String: String] = [:]
     ) -> MarkdownMentionNames {
         members.reduce(into: MarkdownMentionNames()) { map, member in
             guard !member.npub.isEmpty,
-                let name = member.nickname(from: nicknames) ?? PeerDisplayText.sanitize(member.displayName)
+                let name = member.nickname(from: nicknames)
+                    ?? PeerDisplayText.sanitize(projectedNamesByAccountID[member.memberIdHex])
+                    ?? PeerDisplayText.sanitize(member.displayName)
             else { return }
             map[member.npub] = name
         }

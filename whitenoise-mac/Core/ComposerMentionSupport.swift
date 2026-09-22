@@ -10,6 +10,19 @@
 import Foundation
 import MarmotKit
 
+nonisolated enum MentionPublishedName {
+    static func resolve(
+        profileDisplayName: String?,
+        profileName: String?,
+        rosterDisplayName: String?,
+        directoryDisplayName: String?
+    ) -> String? {
+        [profileDisplayName, profileName, rosterDisplayName, directoryDisplayName]
+            .compactMap(PeerDisplayText.sanitize)
+            .first
+    }
+}
+
 nonisolated struct ComposerMentionCandidate: Identifiable, Equatable, Sendable {
     let id: String
     let memberIdHex: String
@@ -31,14 +44,23 @@ nonisolated struct ComposerMentionCandidate: Identifiable, Equatable, Sendable {
     let npubLowercased: String
     let memberIdHexLowercased: String
 
-    init(details: GroupMemberDetailsFfi, nickname: String? = nil) {
+    init(
+        details: GroupMemberDetailsFfi,
+        nickname: String? = nil,
+        projectedDisplayName: String? = nil
+    ) {
         memberIdHex = details.memberIdHex
-        accountIdHex = details.account ?? details.memberIdHex
+        accountIdHex = details.memberIdHex
         npub = details.npub
         let reference = details.npub.isEmpty ? memberIdHex : details.npub
-        let published = PeerDisplayText.sanitize(details.displayName)
+        let published =
+            PeerDisplayText.sanitize(projectedDisplayName)
+            ?? PeerDisplayText.sanitize(details.displayName)
         displayName = nickname ?? published ?? DisplayText.short(reference, head: 10, tail: 6)
-        publishedDisplayName = WorkspaceState.publishedContactName(published, overriddenBy: nickname)
+        publishedDisplayName = WorkspaceState.publishedContactName(
+            published,
+            overriddenBy: nickname
+        )
         searchableNames = [displayName, publishedDisplayName].compactMap { $0 }
         id = memberIdHex
         searchableNamesLowercased = searchableNames.map { $0.lowercased() }

@@ -678,6 +678,43 @@ struct PureValueTests {
         #expect(state.mentionNamesBuildCount == 2)
     }
 
+    @MainActor
+    @Test func resolvedPeerProfileUpgradesUnnamedMentionPickerAndTimelineLabels() {
+        let account = AccountItem.samples[0]
+        let group = ChatItem.samples[0]
+        let state = WorkspaceState(
+            accounts: [account],
+            chatsByAccount: [account.id: [group]],
+            localNotificationCenter: NoopLocalNotificationCenter(),
+            appActivityProvider: { false },
+            conversationWindowVisibilityProvider: { false }
+        )
+        state.activeAccountId = account.id
+        state.selection = .chat(group.id)
+        state.storeGroupMembers(
+            [mentionMember(id: "alice", displayName: "", npub: "npub1alice")],
+            welcomerAccountIdHex: nil,
+            for: group.id
+        )
+
+        #expect(state.mentionRoster().map(\.displayName) == [DisplayText.short("npub1alice", head: 10, tail: 6)])
+        #expect(state.cachedMentionNames(groupIdHex: group.id)["npub1alice"] == nil)
+
+        state.peerProfileFFICache["alice"] = WorkspaceState.CachedPeerProfile(
+            resolved: WorkspaceState.ResolvedPeerFFI(
+                profileDisplayName: "Alice",
+                profileName: nil,
+                profilePicture: nil,
+                directoryDisplayName: nil
+            ),
+            resolvedAt: Date()
+        )
+        state.schedulePeerProfileReprojection(ids: ["alice"])
+
+        #expect(state.mentionRoster().map(\.displayName) == ["Alice"])
+        #expect(state.cachedMentionNames(groupIdHex: group.id)["npub1alice"] == "Alice")
+    }
+
     /// Mention projections fold nicknames in, so they must notice a nickname write — but noticing
     /// it may not cost anything on the read path, which the timeline hits on every window and
     /// every keystroke. Exactly one rebuild per write, and none at all for a write that changed

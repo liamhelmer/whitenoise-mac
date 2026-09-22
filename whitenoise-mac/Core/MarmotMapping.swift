@@ -71,6 +71,42 @@ extension ConversationWindowSnapshotFfi {
             )
         }
     }
+
+    /// Maps the complete conversation window's bounded mention references through the identity
+    /// table carried by that same snapshot. The core owns the published presentation; the host's
+    /// only overlay is the viewer's private nickname.
+    ///
+    /// Mention Markdown is keyed by the canonical npub embedded in the message body, while the
+    /// prepared snapshot intentionally keys identities and references by account-id hex. The
+    /// supplied conversion closes that representation gap without issuing profile or directory
+    /// reads from a row-rendering path.
+    func mentionNames(
+        activeAccount: AccountItem,
+        nicknames: ContactNicknames,
+        npubForAccountIdHex: (String) -> String?
+    ) -> MarkdownMentionNames {
+        let referencedAccountIDs = Set(
+            messages.flatMap { message in
+                message.references.mentions + message.references.replyMentions
+            }
+        )
+        guard !referencedAccountIDs.isEmpty else { return [:] }
+
+        let identitiesByAccountID = Dictionary(
+            identities.map { ($0.accountIdHex, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        return referencedAccountIDs.reduce(into: MarkdownMentionNames()) { names, accountIdHex in
+            guard let npub = npubForAccountIdHex(accountIdHex)?.nilIfBlank else { return }
+            let published = identitiesByAccountID[accountIdHex]
+                .flatMap { PeerDisplayText.sanitize($0.displayName) }
+            let nickname =
+                accountIdHex == activeAccount.accountIdHex
+                ? nil : nicknames.nickname(forContactAccountIdHex: accountIdHex)
+            guard let name = nickname ?? published else { return }
+            names[npub] = name
+        }
+    }
 }
 
 extension ChatSelfMembership {

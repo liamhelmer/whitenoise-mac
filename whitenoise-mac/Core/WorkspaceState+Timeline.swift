@@ -307,6 +307,7 @@ extension WorkspaceState {
         client: any MarmotRuntime,
         owner: TimelineWindowOwner?,
         preparedSenderProfiles: [String: ChatPeerProfile]? = nil,
+        preparedMentionNames: MarkdownMentionNames? = nil,
         projectedClientTokens: Set<String>? = nil
     ) async {
         guard
@@ -331,7 +332,7 @@ extension WorkspaceState {
                 )
             }
         }
-        let mentionNames = cachedMentionNames(groupIdHex: groupIdHex)
+        let mentionNames = preparedMentionNames ?? cachedMentionNames(groupIdHex: groupIdHex)
         guard
             canApplyTimelineWindow(
                 groupIdHex: groupIdHex,
